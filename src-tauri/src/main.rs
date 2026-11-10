@@ -259,6 +259,15 @@ fn main() {
     // tell the bundled frontend where the backend is; see frontend/src/api.ts
     let env_script = format!("window.__AITV_PORT__ = {port};");
     tauri::Builder::default()
+        // a second launch only brings the running window to the front (it would otherwise share
+        // the first one's backend and lose it when the first window closes); must be registered first
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.unminimize();
+                let _ = w.show();
+                let _ = w.set_focus();
+            }
+        }))
         .plugin(tauri::plugin::Builder::<tauri::Wry>::new("aitv-env").js_init_script(env_script).build())
         .plugin(tauri_plugin_dialog::init())
         .manage(BackendState(Mutex::new(Backend { port, reused, ..Default::default() })))
