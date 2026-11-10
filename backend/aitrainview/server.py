@@ -11,7 +11,9 @@ import re
 import threading
 import time
 import traceback
+import uuid
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -23,7 +25,7 @@ from pydantic import BaseModel
 
 from . import __version__
 from .arch import build_structure
-from .events import Bus, dumps, frame
+from .events import Bus, dumps, frame, parse_frame
 from .runtime import ACT_P, ACT_T, DEFAULT_TARGETS
 from .st_reader import SafetensorsCheckpoint
 from .thumbs import MODES, SIGNED_MODES, quantize, resize_nearest, thumbnail
@@ -40,10 +42,25 @@ REPO_RE = re.compile(r"^[\w.\-]+/[\w.\-]+$")
 bus = Bus()
 
 
+@dataclass
+class ExtRun:
+    """A training script attached through aitrainview.watch (it trains; the app only shows)."""
+    run_id: str
+    name: str
+    size: int  # thumbnail tile size the script sends
+    n: int  # number of tensors
+    tiles: dict = field(default_factory=dict)  # mode -> uint8 [n, size, size]
+    lo: dict = field(default_factory=dict)
+    hi: dict = field(default_factory=dict)
+    stats: list = field(default_factory=list)
+    stop: bool = False  # the user pressed stop; told to the script in event replies
+
+
 class State:
     ckpt: SafetensorsCheckpoint | None = None
     structure: dict | None = None
     model_dir: str | None = None
+    ext: ExtRun | None = None  # the shown model is a live training run, not a folder on disk
     atlas_token = 0
     runtime = None
     lock = threading.Lock()
@@ -252,7 +269,7 @@ def open_model(req: OpenReq):
         S.atlas_token += 1  # cancel running atlas jobs
         if S.ckpt is not None:
             S.ckpt.close()
-        S.ckpt, S.structure, S.model_dir = ck, st, path
+        S.ckpt, S.structure, S.model_dir, S.ext = ck, st, path, None
         if rt is not None and rt.model is not None and os.path.abspath(rt.model_dir or "") != os.path.abspath(path):
             try:
                 rt.unload()
@@ -318,8 +335,31 @@ def _prune_cache(keep: Path) -> None:
         print("cache prune failed:", e)
 
 
+def _ext_atlas(token: int, mode: str, size: int, e: ExtRun, st: dict) -> None:
+    """Thumbnails of an attached training run (sent by the script, not read from disk)."""
+    m = mode if mode in e.tiles else "rms" if "rms" in e.tiles else None
+    if m is None:
+        bus.publish({"type": "atlas_error", "token": token, "message": "学習スクリプトから重みのサムネイルがまだ届いていません"})
+        return
+    tiles, lo, hi = e.tiles[m], e.lo[m], e.hi[m]
+    if size != e.size:
+        tiles = np.stack([resize_nearest(t, size) for t in tiles])
+    order = _order_for_atlas(st)
+    for i in range(0, e.n, 48):
+        if S.atlas_token != token:
+            return
+        ids = order[i:i + 48]
+        bus.publish_frame({"type": "atlas_tiles", "token": token, "mode": mode, "size": size, "ids": ids,
+                           "lo": [float(lo[k]) for k in ids], "hi": [float(hi[k]) for k in ids],
+                           "done": min(e.n, i + 48), "total": e.n}, np.ascontiguousarray(tiles[ids]).tobytes())
+    bus.publish({"type": "atlas_done", "token": token, "mode": mode, "cached": True, "live": True})
+
+
 def _atlas_job(token: int, mode: str, size: int) -> None:
-    ck, st = S.ckpt, S.structure
+    ck, st, ext = S.ckpt, S.structure, S.ext
+    if ck is None and ext is not None and st is not None:
+        _ext_atlas(token, mode, size, ext, st)
+        return
     if ck is None or st is None:
         return
     tensors = st["tensors"]
@@ -413,7 +453,7 @@ def start_atlas(req: AtlasReq):
 
 @app.get("/api/tensor/{tid}")
 def tensor_detail(tid: int, size: int = 320, mode: str = "sample"):
-    if S.structure is None or S.ckpt is None:
+    if S.structure is None or (S.ckpt is None and S.ext is None):
         bad("モデルが開かれていません")
     if not (0 <= tid < len(S.structure["tensors"])):
         bad("tensor id が範囲外です", 404)
@@ -422,6 +462,14 @@ def tensor_detail(tid: int, size: int = 320, mode: str = "sample"):
     t = S.structure["tensors"][tid]
     if not t["float"]:
         return binary({**t, "gh": 0, "gw": 0, "unsupported": True})
+    if S.ckpt is None:  # attached training run: the thumbnail the script sent at the start
+        e = S.ext
+        m = mode if mode in e.tiles else "rms"
+        if m not in e.tiles:
+            bad("学習スクリプトから重みのサムネイルがまだ届いていません")
+        return binary({**t, "gh": e.size, "gw": e.size, "lo": float(e.lo[m][tid]), "hi": float(e.hi[m][tid]),
+                       "mode": m, "signed": m in SIGNED_MODES, "stats": e.stats[tid] or {}, "live": True},
+                      np.ascontiguousarray(e.tiles[m][tid]).tobytes())
     th, stats = thumbnail(S.ckpt, t["name"], int(max(16, min(1024, size))), mode, want_stats=True)
     q, lo, hi = quantize(th, mode in SIGNED_MODES)
     return binary({**t, "gh": int(q.shape[0]), "gw": int(q.shape[1]), "lo": lo, "hi": hi, "mode": mode,
@@ -480,6 +528,8 @@ def infer(req: InferReq):
 @app.post("/api/stop")
 def stop():
     runtime().stop_event.set()
+    if S.ext is not None:
+        S.ext.stop = True  # the attached script stops at its next step
     return {"ok": True}
 
 
@@ -573,6 +623,125 @@ def train_save(req: SaveReq):
     return {"ok": True, "path": str(path), "kind": kind}
 
 
+# -------------------------------------------------- attached training runs
+# A training script calls aitrainview.watch (or uses its HF Trainer callback):
+# it sends the model's parameter list, weight thumbnails and live telemetry,
+# and the app shows the run exactly like its own training. The script trains.
+EXT_EVENTS = {"train_start", "train_step", "train_delta", "train_done", "train_error", "train_sample"}
+
+
+class _Entry:
+    """Parameter metadata in the shape arch.build_structure expects."""
+    __slots__ = ("dtype", "shape", "numel")
+
+    def __init__(self, dtype: str, shape):
+        self.dtype = str(dtype)
+        self.shape = tuple(int(s) for s in shape)
+        self.numel = 1
+        for s in self.shape:
+            self.numel *= s
+
+
+class AttachReq(BaseModel):
+    name: str
+    source: str | None = None  # name_or_path of the model being trained
+    config: dict = {}
+    tensors: list[dict]  # [{name, shape, dtype}] (dtype as a safetensors tag: F32, BF16, ...)
+    client: str = ""
+
+
+class RunReq(BaseModel):
+    run: str
+
+
+def _ext(run: str | None) -> ExtRun:
+    e = S.ext
+    if e is None or e.run_id != run:
+        bad("この学習の接続は終わっています（別のモデルが開かれたか、別の学習が接続しました）", 409)
+    return e
+
+
+@app.post("/api/ext/attach")
+def ext_attach(req: AttachReq):
+    if not req.tensors:
+        bad("パラメータがありません")
+    entries = {t["name"]: _Entry(t["dtype"], t["shape"]) for t in req.tensors}
+    st = build_structure(entries, req.source or req.name, cfg=req.config or {}, name=req.name)
+    n = len(st["tensors"])
+    size = 128 if n <= 1500 else 64 if n <= 6000 else 32
+    run = uuid.uuid4().hex[:12]
+    st["external"] = {"run": run, "name": req.name, "client": req.client}
+    with S.lock:
+        S.atlas_token += 1
+        if S.ckpt is not None:
+            S.ckpt.close()
+        S.ckpt, S.structure, S.model_dir = None, st, req.source
+        S.ext = ExtRun(run, req.name, size, n, stats=[None] * n)
+    return {"run": run, "size": size, "ids": {t["name"]: t["id"] for t in st["tensors"]}}
+
+
+@app.post("/api/ext/tiles")
+async def ext_tiles(request: Request):
+    try:
+        h, payload = parse_frame(await request.body())
+    except ValueError as e:
+        bad(str(e))
+    e = _ext(h.get("run"))
+    mode = h.get("mode")
+    if mode not in MODES:
+        bad(f"mode は {MODES} のいずれか")
+    ids = [int(i) for i in h["ids"]]
+    arr = np.frombuffer(payload, np.uint8)
+    if arr.size != len(ids) * e.size * e.size:
+        bad("サムネイルの大きさが合いません")
+    arr = arr.reshape(len(ids), e.size, e.size)
+    if mode not in e.tiles:
+        e.tiles[mode] = np.zeros((e.n, e.size, e.size), np.uint8)
+        e.lo[mode] = np.zeros(e.n, np.float32)
+        e.hi[mode] = np.ones(e.n, np.float32)
+    for k, tid in enumerate(ids):
+        if 0 <= tid < e.n:
+            e.tiles[mode][tid] = arr[k]
+            e.lo[mode][tid] = h["lo"][k]
+            e.hi[mode][tid] = h["hi"][k]
+    for tid, s in zip(ids, h.get("stats") or []):
+        if s and 0 <= tid < e.n:
+            e.stats[tid] = s
+    return {"ok": True}
+
+
+@app.post("/api/ext/ready")
+def ext_ready(req: RunReq):
+    e = _ext(req.run)
+    bus.publish({"type": "ext_attach", "structure": S.structure})
+    bus.status(f"学習スクリプト「{e.name}」が接続しました")
+    return {"ok": True}
+
+
+@app.post("/api/ext/event")
+async def ext_event(request: Request):
+    try:
+        h, payload = parse_frame(await request.body())
+    except ValueError as e:
+        bad(str(e))
+    e = _ext(h.pop("run", None))
+    if h.get("type") not in EXT_EVENTS:
+        bad("unknown event type")
+    if payload:
+        bus.publish_frame(h, payload)
+    else:
+        bus.publish(h)
+    return {"ok": True, "stop": e.stop}
+
+
+@app.post("/api/ext/detach")
+def ext_detach(req: RunReq):
+    e = S.ext
+    if e is not None and e.run_id == req.run:
+        bus.status(f"学習スクリプト「{e.name}」の接続が終わりました")
+    return {"ok": True}
+
+
 # ------------------------------------------------------------- websocket
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
@@ -656,6 +825,12 @@ def main() -> None:
     configure_access(args.port, args.host)
     if args.parent_pid:
         watch_parent(args.parent_pid)
+    try:  # lets training scripts (aitrainview.watch) find the port the app chose
+        info = Path.home() / ".aitrainview" / "backend.json"
+        info.parent.mkdir(parents=True, exist_ok=True)
+        info.write_text(json.dumps({"port": args.port, "host": args.host, "pid": os.getpid()}), encoding="utf-8")
+    except OSError:
+        pass
     print(f"AITrainView backend {__version__} on http://{args.host}:{args.port}", flush=True)
     print(f"  code: {ROOT / 'backend'}\n  cache: {CACHE}\n  outputs: {OUTPUTS}", flush=True)
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")

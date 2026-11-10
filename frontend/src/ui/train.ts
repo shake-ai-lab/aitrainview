@@ -49,10 +49,17 @@ export class TrainPanel {
   private saveBtn = h('button', { onclick: () => this.save() }, '保存');
   private resetBtn = h('button', { onclick: () => this.reset() }, 'リセット');
   private running = false;
+  private form = h('div');
+  private resultBox = h('div');
+  private extNote = h('div', { class: 'hint ext-note', style: { display: 'none' } },
+    h('b', {}, '学習スクリプトから接続中'),
+    h('div', {}, 'この学習はスクリプト側（HF Trainer / 自作ループ）で動いています。ここでは中の様子を表示します。'),
+    h('div', {}, '■ 停止 でスクリプトの学習を止められます。保存はスクリプト側で行ってください。'));
 
   constructor(private app: AppCtx) {
     this.chart = new LossChart(this.chartCanvas, 316, 140);
-    this.el.append(
+    // the settings of the app's own trainer (hidden while a training script is attached)
+    this.form.append(
       h('div', { class: 'grid2' },
         h('label', {}, '手法', this.method),
         h('label', {}, 'ステップ数', this.steps),
@@ -70,6 +77,17 @@ export class TrainPanel {
       this.dataset,
       h('div', { class: 'sub' }, '途中経過を確認するプロンプト（1行1つ）'),
       this.prompts,
+    );
+    this.resultBox.append(
+      h('div', { class: 'sub' }, '学習結果'),
+      this.resultInfo,
+      h('div', { class: 'row' }, this.saveBtn, this.resetBtn),
+      h('div', { class: 'sub' }, '生成サンプルの変化'),
+      this.samples,
+    );
+    this.el.append(
+      this.extNote,
+      this.form,
       h('div', { class: 'row' }, this.startBtn, this.stopBtn),
       this.progress,
       this.stats,
@@ -78,11 +96,7 @@ export class TrainPanel {
         h('button', { onclick: () => this.app.setView('delta') }, 'ΔW を表示'),
         h('button', { onclick: () => this.app.setView('weights') }, '重みを表示'),
       ),
-      h('div', { class: 'sub' }, '学習結果'),
-      this.resultInfo,
-      h('div', { class: 'row' }, this.saveBtn, this.resetBtn),
-      h('div', { class: 'sub' }, '生成サンプルの変化'),
-      this.samples,
+      this.resultBox,
     );
     this.stopBtn.disabled = true;
     const s = app.sock;
@@ -100,6 +114,14 @@ export class TrainPanel {
     s.on('hello', (m) => this.updateResult(m.runtime)); // (re)connect: pick up results that already exist
     this.updateResult(null);
     this.updateMethod();
+  }
+
+  /** A training script is attached (or not): its run replaces the app's own trainer in this panel. */
+  setExternal(on: boolean): void {
+    this.extNote.style.display = on ? '' : 'none';
+    this.form.style.display = on ? 'none' : '';
+    this.resultBox.style.display = on ? 'none' : '';
+    this.startBtn.style.display = on ? 'none' : '';
   }
 
   private updateMethod(): void {
@@ -196,9 +218,11 @@ export class TrainPanel {
     this.app.setActivityMode('training');
     this.app.view?.clearActivity();
     this.app.setView('delta');
+    const method: Record<string, string> = { lora: 'LoRA', full: 'フル微調整', mixed: 'LoRA + 一部フル' };
     this.stats.replaceChildren(
+      ...(m.external ? [h('span', {}, '学習'), h('b', {}, `学習スクリプト（${method[m.method] ?? m.method}）`)] : []),
       h('span', {}, '学習パラメータ'), h('b', {}, `${fmtCount(m.trainable_params)}（${m.modules} 行列）`),
-      h('span', {}, 'サンプル数'), h('b', {}, String(m.examples)),
+      ...(m.examples != null ? [h('span', {}, 'サンプル数'), h('b', {}, String(m.examples))] : []),
     );
     this.app.toast('学習を開始しました。3Dビューは ΔW（学習による変化）表示に切り替わります', 'info');
   }
@@ -206,15 +230,18 @@ export class TrainPanel {
   private lastPulse = 0;
 
   private onStep(m: any): void {
-    if (m.loss === null) return;
+    if (m.loss === null || m.loss === undefined) return;
     this.chart.push(m.step, m.loss);
-    (this.progress.firstChild as HTMLElement).style.width = `${(m.step / m.steps) * 100}%`;
+    // a training script may not know its total steps / token throughput
+    (this.progress.firstChild as HTMLElement).style.width = m.steps ? `${Math.min(100, (m.step / m.steps) * 100)}%` : '100%';
+    const speed = [m.tok_s != null ? `${m.tok_s.toFixed(0)} tok/s` : '', m.step_time != null ? `${m.step_time.toFixed(2)} s/step` : '']
+      .filter(Boolean).join(', ');
     this.stats.replaceChildren(
-      h('span', {}, 'ステップ'), h('b', {}, `${m.step} / ${m.steps}`),
+      h('span', {}, 'ステップ'), h('b', {}, m.steps ? `${m.step} / ${m.steps}` : String(m.step)),
       h('span', {}, 'loss'), h('b', {}, fmtVal(m.loss)),
       h('span', {}, '学習率'), h('b', {}, fmtVal(m.lr, 3)),
       h('span', {}, '勾配ノルム（全体）'), h('b', {}, fmtVal(m.grad_norm)),
-      h('span', {}, '速度'), h('b', {}, `${m.tok_s.toFixed(0)} tok/s, ${m.step_time.toFixed(2)} s/step`),
+      ...(speed ? [h('span', {}, '速度'), h('b', {}, speed)] : []),
     );
     const raw = new Map<number | 'head', number>();
     m.ids.forEach((tid: number, i: number) => {
@@ -235,7 +262,8 @@ export class TrainPanel {
     if (!view) return;
     view.setTiles(m.ids, payload, 'delta', m.size);
     view.setDeltaScales(m.ids, m.scales);
-    m.ids.forEach((tid: number, i: number) => this.app.rel.set(tid, m.rel[i]));
+    // null: relative change undefined (the parameter started at zero)
+    m.ids.forEach((tid: number, i: number) => (Number.isFinite(m.rel[i]) ? this.app.rel.set(tid, m.rel[i]) : this.app.rel.delete(tid)));
   }
 
   private onSample(m: any): void {
@@ -248,7 +276,8 @@ export class TrainPanel {
 
   private onDone(m: any): void {
     this.setRunning(false);
-    this.app.toast(`${m.stopped ? '学習を停止しました' : '学習が完了しました'}（${m.step} ステップ, ${m.elapsed.toFixed(0)} 秒）。推論タブで変化を試せます`, 'ok');
+    const where = this.app.structure?.external ? '' : '。推論タブで変化を試せます';
+    this.app.toast(`${m.stopped ? '学習を停止しました' : '学習が完了しました'}（${m.step} ステップ, ${(m.elapsed ?? 0).toFixed(0)} 秒）${where}`, 'ok');
   }
 }
 

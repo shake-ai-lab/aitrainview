@@ -8,7 +8,7 @@
 import * as THREE from 'three';
 import { CSS2DObject } from 'three/addons/renderers/CSS2DRenderer.js';
 import type { Structure } from '../types';
-import { showToken } from '../util';
+import { resizeNearest, showToken } from '../util';
 import { buildLutTexture } from './colormaps';
 import { ACT_P, ACT_T, computeFlowLayout } from './flowLayout';
 import { computeLayout, FLOOR_POST, FLOOR_PRE, type Layout, type Placement } from './layout';
@@ -439,7 +439,13 @@ export class ModelView {
   /** Weight thumbnails (S×S each, ids order) into the atlas or delta textures. */
   setTiles(ids: number[], bytes: Uint8Array, target: 'atlas' | 'delta', size: number): void {
     this.dirty = true;
-    if (size !== this.tile) return;
+    if (size !== this.tile) {
+      // e.g. ΔW from a training script, which does not know this layout's tile size
+      const from = size * size;
+      const out = new Uint8Array(ids.length * this.tile * this.tile);
+      ids.forEach((_, k) => out.set(resizeNearest(bytes.subarray(k * from, (k + 1) * from), size, this.tile), k * this.tile * this.tile));
+      bytes = out;
+    }
     const S2 = this.tile * this.tile;
     const dirty = new Set<THREE.DataArrayTexture>();
     ids.forEach((tid, k) => this.w.writeRows(String(tid), 0, this.tile, bytes, k * S2, this.tile, target, dirty));

@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aitrainview"
+version = "0.1.0"
+description = "AITrainView: watch LLM / any PyTorch model fine-tuning inside the weights (training-script client + app backend)"
+requires-python = ">=3.10"
+# The training-script client (aitrainview.watch) only needs torch, which your training env already has.
+dependencies = ["numpy"]
+
+[project.optional-dependencies]
+# the app's backend (normally run by the desktop app from backend/run.py)
+server = [
+  "safetensors>=0.4.3,<1",
+  "huggingface_hub>=0.30,<3",
+  "transformers>=4.56,<6",
+  "fastapi>=0.110,<1",
+  "uvicorn[standard]>=0.29,<1",
+]
+
+[tool.setuptools]
+packages = ["aitrainview"]

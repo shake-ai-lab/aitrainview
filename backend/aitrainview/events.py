@@ -38,10 +38,20 @@ def frame(header: dict, payload: bytes = b"") -> bytes:
     return struct.pack("<I", len(h)) + h + payload
 
 
+def parse_frame(buf: bytes) -> tuple[dict, bytes]:
+    """Inverse of frame()."""
+    if len(buf) < 4:
+        raise ValueError("frame too short")
+    (n,) = struct.unpack("<I", buf[:4])
+    if 4 + n > len(buf):
+        raise ValueError("bad frame header length")
+    return json.loads(buf[4:4 + n]), buf[4 + n:]
+
+
 MAX_BACKLOG = 4000  # per client; beyond this, streaming telemetry is dropped for that client
 # state changes the UI must never miss (they are rare, so they may exceed the backlog)
 CRITICAL = {"runtime", "train_start", "train_done", "train_error", "train_reset", "infer_start", "infer_done",
-            "infer_error", "atlas_done", "atlas_error", "status"}
+            "infer_error", "atlas_done", "atlas_error", "status", "ext_attach"}
 
 
 class Bus:

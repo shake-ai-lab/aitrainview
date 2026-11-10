@@ -196,5 +196,57 @@ class DatasetTest(unittest.TestCase):
         self.assertEqual(ids, labels)
 
 
+@unittest.skipUnless(HAS_TORCH, "torch not installed")
+class WatchTest(unittest.TestCase):
+    """The training-script client must draw the same thumbnails as the app does from disk."""
+
+    def test_thumbnails_match_disk_path(self):
+        import torch
+
+        from aitrainview import watch
+        from aitrainview.thumbs import quantize as np_quantize
+        rng = np.random.default_rng(1)
+        with tempfile.TemporaryDirectory() as d:
+            arrays = {"a": rng.standard_normal((300, 517)).astype(np.float32),
+                      "conv": rng.standard_normal((16, 3, 5, 5)).astype(np.float32),
+                      "vec": rng.standard_normal(70).astype(np.float32)}
+            write_safetensors(os.path.join(d, "model.safetensors"), {k: ("F32", v) for k, v in arrays.items()})
+            ck = SafetensorsCheckpoint(d)
+            for name, arr in arrays.items():
+                maps, stats = watch.reduce_blocks(torch.from_numpy(arr), 64, want_stats=True)
+                for mode in watch.MODES:
+                    ref, _ = thumbnail(ck, name, 64, mode)
+                    np.testing.assert_allclose(maps[mode].numpy(), ref, rtol=1e-5, atol=1e-6, err_msg=f"{name}/{mode}")
+                    q, lo, hi = watch.quantize(maps[mode], mode in watch.SIGNED)
+                    rq, rlo, rhi = np_quantize(ref, mode in watch.SIGNED)
+                    self.assertLessEqual(int(np.abs(q.numpy().astype(int) - rq.astype(int)).max()), 1)
+                    self.assertAlmostEqual(lo, rlo, places=4)
+                _, ref_stats = thumbnail(ck, name, 64, "rms", want_stats=True)
+                for k in ("mean", "std", "rms", "min", "max"):
+                    self.assertAlmostEqual(stats[k], ref_stats[k], places=5, msg=f"{name}/{k}")
+            ck.close()
+
+    def test_peft_names(self):
+        from aitrainview.watch import norm_name
+        self.assertEqual(norm_name("base_model.model.model.layers.0.self_attn.q_proj.base_layer.weight"),
+                         "model.layers.0.self_attn.q_proj.weight")
+        self.assertIsNone(norm_name("base_model.model.model.layers.0.self_attn.q_proj.lora_A.default.weight"))
+        self.assertEqual(norm_name("module.fc.weight"), "fc.weight")
+        self.assertEqual(norm_name("base_model.model.score.modules_to_save.default.weight"), "score.weight")
+        self.assertIsNone(norm_name("base_model.model.score.original_module.weight"))
+
+    def test_no_app_is_a_no_op(self):
+        import torch
+
+        from aitrainview.watch import watch
+        model = torch.nn.Linear(4, 3)
+        w = watch(model, url="http://127.0.0.1:9")  # nothing listens there
+        self.assertFalse(w.enabled)
+        loss = model(torch.randn(2, 4)).sum()
+        loss.backward()
+        w.step(loss)  # must not raise
+        w.close()
+
+
 if __name__ == "__main__":
     unittest.main()

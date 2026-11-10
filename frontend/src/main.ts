@@ -9,7 +9,7 @@ import type { RuntimeInfo, Structure } from './types';
 import { InferPanel } from './ui/infer';
 import { InspectPanel } from './ui/inspect';
 import { TrainPanel } from './ui/train';
-import { fmtBytes, fmtCount, fmtShape, h, showToken } from './util';
+import { fmtBytes, fmtCount, fmtShape, h, resizeNearest, showToken } from './util';
 
 const EXAMPLES = ['Qwen/Qwen3-0.6B', 'Qwen/Qwen2.5-0.5B-Instruct', 'google/gemma-3-270m-it', 'HuggingFaceTB/SmolLM2-360M-Instruct'];
 const RECENT_KEY = 'aitv.recent';
@@ -74,20 +74,21 @@ class App implements AppCtx {
   private welcome: HTMLElement;
   private tabs: Record<string, { btn: HTMLElement; body: HTMLElement }> = {};
   private inspect: InspectPanel;
+  private train: TrainPanel;
   private atlasToken = 0;
 
   constructor() {
     this.viewer = new Viewer(this.stage);
     this.inspect = new InspectPanel(this);
     const infer = new InferPanel(this);
-    const train = new TrainPanel(this);
+    this.train = new TrainPanel(this);
     this.welcome = this.buildWelcome();
     this.root.append(
       this.buildTopbar(),
       h('div', { class: 'main' }, this.stage, this.buildLeft(), this.buildRight([
         ['inspect', '詳細', this.inspect.el],
         ['infer', '推論', infer.el],
-        ['train', '学習', train.el],
+        ['train', '学習', this.train.el],
       ])),
       this.loadbar,
       this.tooltip,
@@ -330,6 +331,7 @@ class App implements AppCtx {
     view.setActivityMode(keepState ? this.activityMode : 'none');
     this.welcome.style.display = 'none';
     this.sourceInput.value = st.name;
+    this.train.setExternal(!!st.external);
     this.renderModelInfo();
     if (keepState) this.replayInto(view);
     if (keepTid >= 0) { // keep the selection, without switching away from the tab in use
@@ -460,6 +462,7 @@ class App implements AppCtx {
     const experts = c.num_experts ?? c.num_local_experts;
     this.modelInfo.replaceChildren(
       h('div', { class: 'model-name', title: st.model_dir }, st.name),
+      ...(st.external ? [h('div', { class: 'live-badge' }, '● 学習スクリプトから接続中')] : []),
       h('div', { class: 'muted small' }, [st.model_type, ...(st.architectures ?? [])].filter(Boolean).join(' · ')),
       h('div', { class: 'kv' },
         row('パラメータ', fmtCount(st.total_params)),
@@ -605,6 +608,11 @@ class App implements AppCtx {
       }
     });
     s.on('status', (m) => this.toast(m.message, m.level === 'error' ? 'error' : 'info'));
+    // a training script attached (aitrainview.watch): show its model, then its training live
+    s.on('ext_attach', (m) => {
+      this.setStructure(m.structure as Structure);
+      this.showTab('train');
+    });
     s.on('download', (m) => {
       this.loadText.textContent = `ダウンロード中 ${fmtBytes(m.bytes)}${m.total ? ` / ${fmtBytes(m.total)}` : ''}`;
       this.loadbar.classList.add('on');
@@ -665,16 +673,6 @@ class App implements AppCtx {
       this.view?.writeAttention(m.q0, m.nq, m.nk, m.L, m.H, payload);
     });
   }
-}
-
-/** Nearest-neighbour resize of an S×S uint8 tile (ΔW tiles when the layout uses another tile size). */
-function resizeNearest(src: Uint8Array, from: number, to: number): Uint8Array {
-  const out = new Uint8Array(to * to);
-  for (let y = 0; y < to; y++) {
-    const row = Math.floor((y * from) / to) * from;
-    for (let x = 0; x < to; x++) out[y * to + x] = src[row + Math.floor((x * from) / to)];
-  }
-  return out;
 }
 
 new App();

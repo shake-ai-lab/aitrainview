@@ -4,6 +4,7 @@ frontend/dist/
 outputs/
 __pycache__/
 *.pyc
+*.egg-info/
 # machine-local cargo config (target dir on D:)
 .cargo/
 src-tauri/target/

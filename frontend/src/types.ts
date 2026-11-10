@@ -53,6 +53,8 @@ export interface Structure {
   towers: Tower[];
   main_tower: number;
   dtype_counts: Record<string, number>;
+  /** set when the model is a live training run attached from a script (aitrainview.watch) */
+  external?: { run: string; name: string; client: string } | null;
 }
 
 export interface RuntimeInfo {

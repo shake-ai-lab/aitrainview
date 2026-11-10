@@ -51,6 +51,16 @@ export function showToken(t: string): string {
   return t.replace(/\n/g, '↵').replace(/\t/g, '⇥').replace(/^ /, '␣') || '∅';
 }
 
+/** Nearest-neighbour resize of a from×from uint8 tile to to×to. */
+export function resizeNearest(src: Uint8Array, from: number, to: number): Uint8Array {
+  const out = new Uint8Array(to * to);
+  for (let y = 0; y < to; y++) {
+    const row = Math.floor((y * from) / to) * from;
+    for (let x = 0; x < to; x++) out[y * to + x] = src[row + Math.floor((x * from) / to)];
+  }
+  return out;
+}
+
 export function clamp(v: number, a: number, b: number): number {
   return Math.max(a, Math.min(b, v));
 }

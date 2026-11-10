@@ -71,6 +71,49 @@ npm run check          # 型チェック + バックエンドの単体テスト
 5. **保存**: LoRA は PEFT 互換のアダプタ（`adapter_model.safetensors` + `adapter_config.json`）、フル微調整は元のモデルと同じ形式のフォルダ一式（safetensors・config・トークナイザ）として書き出します。フル微調整の保存先は AITrainView でそのまま開けるので、変化した重みを 3D で確認できます
 6. **リセット / 元に戻す**: LoRA は外すだけ、フル微調整はディスクから重みを読み込み直します。未保存の学習結果が消える操作（解放・再読み込み・別のモデルを開く）の前には確認が出ます
 
+## 自分の学習スクリプトの中を見る（HF Trainer / 自作ループ）
+
+アプリ内の学習機能とは別に、**普段どおり書いた学習スクリプトをアプリに接続して**、学習中の重み・勾配・ΔW をリアルタイムに見られます。学習するのはスクリプトで、アプリは見るだけです（アプリ側でモデルを GPU に載せないので VRAM も二重に使いません）。LLM に限らず、どんな PyTorch モデルでも使えます。
+
+```bash
+# 学習に使う Python 環境に入れる（依存は torch だけ。プロジェクトの .venv には入れてあります）
+pip install -e <このリポジトリ>/backend
+```
+
+**Hugging Face Trainer**（1 行追加するだけ）:
+
+```python
+from aitrainview.watch import AITrainViewCallback
+
+trainer = Trainer(model=model, args=args, train_dataset=ds, callbacks=[AITrainViewCallback()])
+trainer.train()
+```
+
+**自作の学習ループ**:
+
+```python
+from aitrainview.watch import watch
+
+w = watch(model, steps=num_steps)
+for batch in loader:
+    loss = loss_fn(model(batch.x), batch.y)
+    loss.backward()
+    w.step(loss)            # backward() の後、optimizer.step() の前
+    optimizer.step(); optimizer.zero_grad()
+    if w.stop_requested:    # アプリの「■ 停止」
+        break
+w.close()
+```
+
+- アプリを先に起動しておきます。スクリプトが接続すると、そのモデルが 3D に表示され、学習タブに loss・勾配・ΔW が流れます
+- PEFT の LoRA は、元の行列に対する ΔW（B·A）として表示します。フル微調整は学習開始時からの変化を表示します
+- アプリの「■ 停止」で、スクリプトの学習を止められます（HF Trainer は自動、自作ループは `w.stop_requested` を見る）
+- アプリが起動していなければ何もしません（学習はそのまま続きます）
+- 接続先は `AITV_URL`、なければアプリが書く `~/.aitrainview/backend.json` のポート、なければ `127.0.0.1:8765`
+- `AITrainViewCallback(log_every=1, every_sec=0.7)`: loss・勾配を送る間隔（ステップ）と ΔW を送る最短間隔（秒）
+
+動く例: `examples/hf_lora_trainer.py`（Qwen3-0.6B を HF Trainer + PEFT LoRA で学習）、`examples/custom_loop_cnn.py`（自作ループで CNN を学習）。
+
 ## 構成
 
 ```
@@ -80,7 +123,9 @@ backend/aitrainview/
   thumbs.py      重み行列をブロック縮約してヒートマップ化（RMS / 平均 / 間引き / 最大|w|）
   runtime.py     torch で推論。全モジュールにフックして活性・Attention・logit lens を送信
   trainer.py     自前の軽量 LoRA / フル微調整。勾配ノルム・ΔW・サンプル生成を送信、保存
-  server.py      FastAPI（REST + WebSocket）。ビルド済みフロントも配信
+  watch.py       学習スクリプト用の接続ライブラリ（HF Trainer の callback / 自作ループ用 watch）
+  server.py      FastAPI（REST + WebSocket）。ビルド済みフロントも配信。学習スクリプトの受け口（/api/ext/*）
+examples/        学習スクリプトから接続する例（HF Trainer + LoRA、自作ループの CNN）
 backend/tests/   単体テスト（GPU・モデルのダウンロード不要）
 frontend/src/
   scene/flowLayout.ts   フロー（計算グラフ）レイアウト

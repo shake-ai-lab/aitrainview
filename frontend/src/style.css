@@ -133,6 +133,23 @@ input[type='checkbox'] {
 .source input {
   flex: 1;
 }
+.live-badge {
+  color: var(--ok);
+  font-size: 12px;
+  margin: 2px 0;
+}
+.ext-note {
+  border: 1px solid var(--line-2);
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin-bottom: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.ext-note b {
+  color: var(--ok);
+}
 .token-pop {
   position: relative;
 }

@@ -101,13 +101,15 @@ def display_name(model_dir: str) -> str:
     return os.path.basename(os.path.normpath(model_dir))
 
 
-def _tower_name(prefix: str, is_main: bool) -> str:
+def _tower_name(prefix: str, is_main: bool, textual: bool) -> str:
     p = prefix.lower()
     if "vision" in p or "visual" in p:
         return "Vision"
     if "audio" in p:
         return "Audio"
-    return "Language" if is_main else prefix
+    if is_main and textual:  # a language model's decoder stack
+        return "Language"
+    return prefix or "Model"
 
 
 def _make_block(prefix: str, idx: int, names: list[str], tid: dict, tensors: list) -> dict:
@@ -185,15 +187,19 @@ def _make_block(prefix: str, idx: int, names: list[str], tid: dict, tensors: lis
     return {"index": idx, "norms": norms, "groups": out_groups}
 
 
-def build_structure(ckpt: SafetensorsCheckpoint, model_dir: str) -> dict:
-    cfg = load_config(model_dir)
+def build_structure(ckpt: SafetensorsCheckpoint | dict, model_dir: str, cfg: dict | None = None,
+                    name: str | None = None) -> dict:
+    """ckpt: a checkpoint on disk, or a {name: entry} mapping whose entries have .dtype
+    (safetensors tag), .shape and .numel (e.g. the parameters of a model being trained)."""
+    entries = ckpt.entries if isinstance(ckpt, SafetensorsCheckpoint) else ckpt
+    cfg = load_config(model_dir) if cfg is None else cfg
     summary = summarize_config(cfg)
-    names = sorted(ckpt.entries, key=natural_key)
+    names = sorted(entries, key=natural_key)
 
     tensors = []
     tid: dict[str, int] = {}
     for i, n in enumerate(names):
-        e = ckpt.entries[n]
+        e = entries[n]
         shape = [int(s) for s in e.shape]
         big_dims = sum(1 for s in shape if s > 1)
         kind = "matrix" if len(shape) >= 2 and big_dims >= 2 else ("vector" if e.numel > 1 else "scalar")
@@ -225,7 +231,7 @@ def build_structure(ckpt: SafetensorsCheckpoint, model_dir: str) -> dict:
                 loose.extend(lst)
 
     def numel_of(ns):
-        return sum(ckpt.entries[x].numel for x in ns)
+        return sum(entries[x].numel for x in ns)
 
     towers = []
     for p, m in sorted(stacks.items(), key=lambda kv: -numel_of([x for v in kv[1].values() for x in v])):
@@ -253,6 +259,8 @@ def build_structure(ckpt: SafetensorsCheckpoint, model_dir: str) -> dict:
         (t["pre"] if PRE_RE.search(rel) else t["post"]).append(item)
 
     layer_types = summary.get("layer_types")
+    # a token vocabulary (config or an embedding table) marks a language model
+    textual = bool(summary.get("vocab_size")) or any(re.search(r"(embed_tokens|wte|word_emb|tok_emb)", n) for n in names)
     out_towers = []
     for i, t in enumerate(towers):
         blocks = []
@@ -286,14 +294,14 @@ def build_structure(ckpt: SafetensorsCheckpoint, model_dir: str) -> dict:
         params = sum(tensors[it["t"]]["numel"] for it in pre + post) + numel_of(
             [x for v in t["m"].values() for x in v])
         out_towers.append({
-            "name": _tower_name(t["prefix"], i == 0), "prefix": t["prefix"], "ref_dim": int(ref),
+            "name": _tower_name(t["prefix"], i == 0, textual), "prefix": t["prefix"], "ref_dim": int(ref),
             "params": params, "pre": pre, "post": post, "blocks": blocks, "tied_head": tied,
         })
 
     dtype_counts = Counter(t["dtype"] for t in tensors)
     return {
-        "model_dir": os.path.abspath(model_dir),
-        "name": display_name(model_dir),
+        "model_dir": os.path.abspath(model_dir) if os.path.isdir(model_dir) else model_dir,
+        "name": name or display_name(model_dir),
         "model_type": summary.get("model_type") or "",
         "architectures": summary.get("architectures", []),
         "config": summary,
