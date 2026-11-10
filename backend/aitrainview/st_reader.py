@@ -103,7 +103,12 @@ class SafetensorsCheckpoint:
             with open(index, encoding="utf-8") as fh:
                 weight_map = json.load(fh).get("weight_map", {})
             files = sorted({os.path.join(self.model_dir, v) for v in weight_map.values()})
-            files = [f for f in files if os.path.exists(f)]
+            missing = [os.path.basename(f) for f in files if not os.path.exists(f)]
+            if missing:  # a half-copied / half-downloaded model would otherwise open with layers missing
+                raise FileNotFoundError(
+                    f"{self.model_dir} の重みファイルが {len(missing)} 個足りません: {', '.join(missing[:3])}"
+                    + (" ほか" if len(missing) > 3 else "")
+                )
             if files:
                 return files
         return sorted(glob.glob(os.path.join(self.model_dir, "*.safetensors")))
@@ -147,9 +152,6 @@ class SafetensorsCheckpoint:
         return arr.reshape(e.shape) if e.shape else arr
 
     def close(self) -> None:
-        for mm in self._maps.values():
-            try:
-                mm._mmap.close()  # type: ignore[attr-defined]
-            except Exception:
-                pass
+        # numpy closes a memmap when the last view of it is gone; closing it here
+        # would break views that a running thumbnail job still holds
         self._maps.clear()

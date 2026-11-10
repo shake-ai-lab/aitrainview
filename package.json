@@ -10,8 +10,10 @@
     "app:build": "tauri build --no-bundle",
     "app:installer": "tauri build",
     "web": "vite --config frontend/vite.config.ts",
-    "backend": "node scripts/backend.mjs",
+    "backend": "node scripts/py.mjs backend/run.py",
     "typecheck": "tsc -p frontend --noEmit",
+    "test:backend": "node scripts/py.mjs -m unittest discover -s backend/tests",
+    "check": "npm run typecheck && npm run test:backend",
     "tauri": "tauri"
   },
   "dependencies": {

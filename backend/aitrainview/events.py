@@ -38,10 +38,17 @@ def frame(header: dict, payload: bytes = b"") -> bytes:
     return struct.pack("<I", len(h)) + h + payload
 
 
+MAX_BACKLOG = 4000  # per client; beyond this, streaming telemetry is dropped for that client
+# state changes the UI must never miss (they are rare, so they may exceed the backlog)
+CRITICAL = {"runtime", "train_start", "train_done", "train_error", "train_reset", "infer_start", "infer_done",
+            "infer_error", "atlas_done", "atlas_error", "status"}
+
+
 class Bus:
     def __init__(self) -> None:
         self.loop: asyncio.AbstractEventLoop | None = None
         self._subs: set[asyncio.Queue] = set()
+        self._dropping: set[int] = set()
 
     def subscribe(self) -> asyncio.Queue:
         q: asyncio.Queue = asyncio.Queue()
@@ -50,8 +57,11 @@ class Bus:
 
     def unsubscribe(self, q: asyncio.Queue) -> None:
         self._subs.discard(q)
+        self._dropping.discard(id(q))
 
-    def publish(self, msg) -> None:
+    def publish(self, msg, critical: bool | None = None) -> None:
+        if critical is None:
+            critical = isinstance(msg, dict) and msg.get("type") in CRITICAL
         data = msg if isinstance(msg, (bytes, bytearray, str)) else dumps(msg)
         loop = self.loop
         if loop is None or loop.is_closed():
@@ -59,8 +69,13 @@ class Bus:
 
         def put() -> None:
             for q in list(self._subs):
-                if q.qsize() < 4000:
+                if critical or q.qsize() < MAX_BACKLOG:
                     q.put_nowait(data)
+                    if q.qsize() < MAX_BACKLOG // 2:
+                        self._dropping.discard(id(q))
+                elif id(q) not in self._dropping:
+                    self._dropping.add(id(q))
+                    print(f"[events] a client is {MAX_BACKLOG} messages behind; dropping telemetry for it", flush=True)
 
         try:
             loop.call_soon_threadsafe(put)

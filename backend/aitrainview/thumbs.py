@@ -80,8 +80,7 @@ def thumbnail(ckpt: SafetensorsCheckpoint, name: str, size: int, mode: str = "rm
             flat = chunk.ravel()
             n += flat.size
             s1 += float(flat.sum(dtype=np.float64))
-            s2 += float(np.dot(flat.astype(np.float64), flat.astype(np.float64))) if flat.size < 4_000_000 \
-                else float(np.dot(flat, flat))
+            s2 += float(np.einsum("i,i->", flat, flat, dtype=np.float64))  # float64 accumulation, no big copy
             mn = min(mn, float(flat.min()))
             mx = max(mx, float(flat.max()))
             samples.append(flat[::stride].copy())

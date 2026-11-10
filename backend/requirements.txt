@@ -1,8 +1,10 @@
-# torch は CUDA 版を別途入れる:
+# torch は CUDA 版を別途入れる（重みの 3D 表示だけなら不要）:
 #   uv pip install torch --index-url https://download.pytorch.org/whl/cu126
-numpy
-safetensors
-huggingface_hub
-transformers>=4.56
-fastapi
-uvicorn[standard]
+# 動作確認済み: torch 2.14.1+cu126, transformers 5.22.2, huggingface_hub 2.4.0,
+#               numpy 2.5.4, safetensors 0.8.0, fastapi 0.162.2, uvicorn 0.54.0
+numpy>=1.26,<3
+safetensors>=0.4.3,<1
+huggingface_hub>=0.30,<3
+transformers>=4.56,<6
+fastapi>=0.110,<1
+uvicorn[standard]>=0.29,<1

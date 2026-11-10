@@ -15,22 +15,25 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import numpy as np
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import __version__
 from .arch import build_structure
 from .events import Bus, dumps, frame
+from .runtime import ACT_P, ACT_T, DEFAULT_TARGETS
 from .st_reader import SafetensorsCheckpoint
 from .thumbs import MODES, SIGNED_MODES, quantize, resize_nearest, thumbnail
 
 ROOT = Path(__file__).resolve().parents[2]
 DIST = ROOT / "frontend" / "dist"
 CACHE = Path(os.environ.get("AITV_CACHE", Path.home() / ".aitrainview" / "cache"))
-OUTPUTS = ROOT / "outputs"
+CACHE_LIMIT = int(os.environ.get("AITV_CACHE_MB", "512")) * 2**20  # atlas cache, least recently used go first
+# the desktop shell points this at Documents when it runs from an installed copy (not writable / not visible)
+OUTPUTS = Path(os.environ.get("AITV_OUTPUTS") or ROOT / "outputs")
 ALLOW_PATTERNS = ["*.json", "*.safetensors", "*.txt", "*.model", "*.jinja", "*.tiktoken", "tokenizer*"]
 REPO_RE = re.compile(r"^[\w.\-]+/[\w.\-]+$")
 
@@ -64,10 +67,48 @@ async def lifespan(_app):
 
 app = FastAPI(title="AITrainView", version=__version__, lifespan=lifespan)
 
-# The Tauri app serves its frontend from its own origin and calls this API directly.
-# Only that origin (plus same-origin / the Vite dev server via proxy) is allowed.
+# Who may call this API: the Tauri app (its own origin), the frontend served by this
+# backend itself, and the Vite dev server. Any other web page open in a browser is
+# refused, as are requests whose Host is not loopback (DNS rebinding).
 TAURI_ORIGINS = ["http://tauri.localhost", "https://tauri.localhost", "tauri://localhost"]
-app.add_middleware(CORSMiddleware, allow_origins=TAURI_ORIGINS, allow_methods=["*"], allow_headers=["*"])
+VITE_PORT = 5173
+LOOPBACK = {"127.0.0.1", "localhost", "[::1]"}
+_origins: set[str] = set()
+_check_host = True
+
+
+def configure_access(port: int, host: str = "127.0.0.1") -> None:
+    global _check_host
+    _origins.clear()
+    _origins.update(TAURI_ORIGINS)
+    _origins.update(o.strip() for o in os.environ.get("AITV_ALLOW_ORIGINS", "").split(",") if o.strip())
+    for p in {port, VITE_PORT}:
+        for name in ("127.0.0.1", "localhost"):
+            _origins.add(f"http://{name}:{p}")
+    _check_host = host in ("127.0.0.1", "localhost", "::1")
+
+
+def origin_allowed(origin: str | None) -> bool:
+    return not origin or origin in _origins
+
+
+def host_allowed(host: str | None) -> bool:
+    if not host or not _check_host:
+        return True
+    name = host.split("]")[0] + "]" if host.startswith("[") else host.rsplit(":", 1)[0]
+    return name.lower() in LOOPBACK
+
+
+configure_access(8765)
+app.add_middleware(CORSMiddleware, allow_origin_regex=r"^(https?://tauri\.localhost|tauri://localhost|http://(127\.0\.0\.1|localhost):\d+)$",
+                   allow_methods=["*"], allow_headers=["*"])
+
+
+@app.middleware("http")
+async def guard(request: Request, call_next):
+    if not host_allowed(request.headers.get("host")) or not origin_allowed(request.headers.get("origin")):
+        return JSONResponse({"detail": "このオリジンからのアクセスは許可されていません"}, status_code=403)
+    return await call_next(request)
 
 
 def binary(header: dict, payload: bytes = b"") -> Response:
@@ -81,7 +122,8 @@ def bad(msg: str, code: int = 400):
 # ----------------------------------------------------------------- system
 @app.get("/api/health")
 def health():
-    return {"ok": True, "version": __version__}
+    # "app" lets the desktop shell tell this backend apart from another program on the port
+    return {"ok": True, "app": "aitrainview", "version": __version__}
 
 
 @app.get("/api/system")
@@ -89,16 +131,15 @@ def system():
     info = {"version": __version__, "torch": None, "cuda": False}
     try:
         import torch
+
+        from .runtime import bf16_supported
         info["torch"] = torch.__version__
         info["cuda"] = torch.cuda.is_available()
         if info["cuda"]:
             p = torch.cuda.get_device_properties(0)
             info["gpu"] = p.name
             info["vram_gb"] = round(p.total_memory / 2**30, 1)
-            try:
-                info["bf16"] = torch.cuda.is_bf16_supported(including_emulation=False)
-            except TypeError:
-                info["bf16"] = torch.cuda.get_device_capability()[0] >= 8
+            info["bf16"] = bf16_supported(torch)
     except Exception as e:
         info["torch_error"] = str(e)
     try:
@@ -137,10 +178,12 @@ def _download(repo_id: str, token: str | None) -> str:
     except Exception:
         pass
     total = None
+    blobs: set[str] | None = None  # cache blob names of exactly the files being downloaded
     try:
         info = HfApi().model_info(repo_id, files_metadata=True, token=token)
-        total = sum((s.size or 0) for s in info.siblings
-                    if any(fnmatch.fnmatch(s.rfilename, p) for p in ALLOW_PATTERNS))
+        files = [s for s in info.siblings if any(fnmatch.fnmatch(s.rfilename, p) for p in ALLOW_PATTERNS)]
+        total = sum((s.size or 0) for s in files)
+        blobs = {s.lfs.sha256 if s.lfs else s.blob_id for s in files} - {None} or None
     except Exception as e:
         name = type(e).__name__
         if "Gated" in name or "401" in str(e) or "403" in str(e):
@@ -151,12 +194,21 @@ def _download(repo_id: str, token: str | None) -> str:
     cache_dir = Path(constants.HF_HUB_CACHE) / ("models--" + repo_id.replace("/", "--")) / "blobs"
     stop = threading.Event()
 
+    def downloaded() -> int:
+        size = 0
+        for f in cache_dir.iterdir() if cache_dir.exists() else ():
+            # finished blobs are named by their hash, partial ones get ".incomplete" appended;
+            # blobs of other revisions of the repo are not part of this download
+            if blobs is None or f.name.split(".")[0] in blobs:
+                try:
+                    size += f.stat().st_size
+                except OSError:  # renamed from .incomplete meanwhile
+                    pass
+        return size
+
     def poll():
         while not stop.wait(0.5):
-            size = 0
-            if cache_dir.exists():
-                size = sum(f.stat().st_size for f in cache_dir.iterdir() if f.is_file())
-            bus.publish({"type": "download", "repo": repo_id, "bytes": size, "total": total})
+            bus.publish({"type": "download", "repo": repo_id, "bytes": downloaded(), "total": total})
 
     threading.Thread(target=poll, daemon=True).start()
     bus.status(f"{repo_id} をダウンロード中…")
@@ -249,6 +301,23 @@ def _order_for_atlas(st: dict) -> list[int]:
     return order
 
 
+def _prune_cache(keep: Path) -> None:
+    """Keep the atlas cache under CACHE_LIMIT, dropping the least recently used files first."""
+    try:
+        now = time.time()
+        for p in CACHE.glob("atlas-*.tmp"):  # left behind by a crash mid-write
+            if now - p.stat().st_mtime > 3600:
+                p.unlink(missing_ok=True)
+        files = sorted(CACHE.glob("atlas-*.npz"), key=lambda p: p.stat().st_mtime, reverse=True)
+        total = 0
+        for p in files:
+            total += p.stat().st_size
+            if total > CACHE_LIMIT and p != keep:
+                p.unlink(missing_ok=True)
+    except OSError as e:
+        print("cache prune failed:", e)
+
+
 def _atlas_job(token: int, mode: str, size: int) -> None:
     ck, st = S.ckpt, S.structure
     if ck is None or st is None:
@@ -278,6 +347,10 @@ def _atlas_job(token: int, mode: str, size: int) -> None:
                 cached = None
         if cached is not None:
             tiles, lo, hi = cached
+            try:
+                os.utime(path)  # recently used: pruned last
+            except OSError:
+                pass
             order = _order_for_atlas(st)
             for i in range(0, n, 48):
                 if S.atlas_token != token:
@@ -317,6 +390,7 @@ def _atlas_job(token: int, mode: str, size: int) -> None:
             with open(tmp, "wb") as fh:
                 np.savez(fh, tiles=tiles, lo=lo, hi=hi)
             os.replace(tmp, path)
+            _prune_cache(keep=path)
         bus.publish({"type": "atlas_done", "token": token, "mode": mode, "cached": False,
                      "elapsed": time.time() - t0})
     except Exception as e:
@@ -429,7 +503,7 @@ class TrainReq(BaseModel):
     batch_size: int = 2
     seq_len: int = 256
     warmup: int = 5
-    targets: list[str] = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    targets: list[str] = DEFAULT_TARGETS
     layers: str = ""
     sample_every: int = 20
     sample_prompts: list[str] = []
@@ -447,55 +521,62 @@ def train(req: TrainReq):
     return {"ok": True}
 
 
-class LoraEnable(BaseModel):
-    enabled: bool
-
-
-@app.post("/api/lora/enable")
-def lora_enable(req: LoraEnable):
-    runtime().set_lora_enabled(req.enabled)
-    return runtime().info()
-
-
-@app.post("/api/lora/reset")
-def lora_reset():
+@app.post("/api/train/reset")
+def train_reset():
+    """Undo training: remove the LoRA, or reload the weights from disk after a full fine-tune."""
     rt = runtime()
     if rt.busy:
         bad("実行中の処理があります")
+    if rt.full:
+        try:
+            rt.reload()
+        except RuntimeError as e:
+            bad(str(e))
+        bus.publish({"type": "train_reset", "reloading": True})
+        return {**rt.info(), "reloading": True}
     if rt.lora:
         from .trainer import reset_lora
-        reset_lora(rt)
-    bus.publish({"type": "lora_reset"})
+        try:
+            rt.exclusive("reset", lambda: reset_lora(rt))
+        except RuntimeError as e:
+            bad(str(e))
+    bus.publish({"type": "train_reset"})
     return rt.info()
 
 
-class LoraSave(BaseModel):
-    path: str | None = None
+class SaveReq(BaseModel):
+    path: str | None = None  # default: outputs/<lora|full>-<time>
+    parent: str | None = None  # or: a new <lora|full>-<time> folder inside this one
 
 
-@app.post("/api/lora/save")
-def lora_save(req: LoraSave):
+@app.post("/api/train/save")
+def train_save(req: SaveReq):
+    """LoRA → PEFT adapter folder; full fine-tune → a complete model folder (safetensors)."""
     rt = runtime()
-    if not rt.lora:
-        bad("保存するLoRAがありません")
-    from .trainer import save_lora
-    out = req.path or str(OUTPUTS / time.strftime("lora-%Y%m%d-%H%M%S"))
+    if not rt.full and not rt.lora:
+        bad("保存する学習結果がありません（先に学習してください）")
+    from . import trainer
+    kind, save = ("full", trainer.save_full) if rt.full else ("lora", trainer.save_lora)
+    name = time.strftime(f"{kind}-%Y%m%d-%H%M%S")
+    out = req.path or str(Path(req.parent) / name if req.parent else OUTPUTS / name)
+
+    def job():
+        path = save(rt, out)
+        rt.unsaved = False
+        return path
+
     try:
-        save_lora(rt, out)
-    except RuntimeError as e:
-        bad(str(e))
-    return {"ok": True, "path": out}
+        path = rt.exclusive("saving", job)
+    except (RuntimeError, OSError) as e:
+        traceback.print_exc()
+        bad(f"保存に失敗しました: {e}")
+    return {"ok": True, "path": str(path), "kind": kind}
 
 
 # ------------------------------------------------------------- websocket
-def _local_origin(origin: str) -> bool:
-    return origin in TAURI_ORIGINS or bool(re.match(r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$", origin))
-
-
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
-    origin = ws.headers.get("origin")
-    if origin and not _local_origin(origin):
+    if not host_allowed(ws.headers.get("host")) or not origin_allowed(ws.headers.get("origin")):
         await ws.close(code=1008)
         return
     await ws.accept()
@@ -512,7 +593,8 @@ async def ws_endpoint(ws: WebSocket):
     task = asyncio.create_task(sender())
     try:
         await ws.send_text(dumps({"type": "hello", "version": __version__,
-                                  "runtime": S.runtime.info() if S.runtime else None}))
+                                  "runtime": S.runtime.info() if S.runtime else None,
+                                  "limits": {"act_p": ACT_P, "act_t": ACT_T}}))
         while True:
             await ws.receive_text()
     except (WebSocketDisconnect, RuntimeError):
@@ -526,13 +608,56 @@ if DIST.exists():
     app.mount("/", StaticFiles(directory=str(DIST), html=True), name="static")
 
 
+def watch_parent(pid: int) -> None:
+    """Exit as soon as the process that started us is gone.
+
+    The desktop shell kills the backend on a normal exit, but not when it crashes or
+    is killed itself; without this the orphan would keep the port and the GPU memory.
+    """
+    def gone() -> None:
+        print(f"parent process {pid} exited; shutting down", flush=True)
+        os._exit(0)
+
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.OpenProcess.restype = wintypes.HANDLE
+        k32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        k32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+        handle = k32.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE; holding it pins the pid
+        if not handle:
+            gone()
+
+        def wait() -> None:
+            k32.WaitForSingleObject(handle, 0xFFFFFFFF)
+            gone()
+    else:
+        def wait() -> None:
+            while True:
+                time.sleep(1.0)
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    gone()
+                except PermissionError:
+                    pass
+
+    threading.Thread(target=wait, name="parent-watch", daemon=True).start()
+
+
 def main() -> None:
     import uvicorn
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8765)
+    ap.add_argument("--parent-pid", type=int, default=0, help="exit when this process exits (set by the desktop app)")
     args = ap.parse_args()
-    print(f"AITrainView backend on http://{args.host}:{args.port}", flush=True)
+    configure_access(args.port, args.host)
+    if args.parent_pid:
+        watch_parent(args.parent_pid)
+    print(f"AITrainView backend {__version__} on http://{args.host}:{args.port}", flush=True)
+    print(f"  code: {ROOT / 'backend'}\n  cache: {CACHE}\n  outputs: {OUTPUTS}", flush=True)
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 
 

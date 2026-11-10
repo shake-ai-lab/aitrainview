@@ -11,20 +11,20 @@ stay identical to the checkpoint names the 3D view is built from.
 """
 from __future__ import annotations
 
-import inspect
 import json
 import math
 import os
 import random
-import re
+import shutil
 import time
 import traceback
+from pathlib import Path
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-DEFAULT_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+from .runtime import DEFAULT_TARGETS
 
 
 class LoRALinear(nn.Module):
@@ -105,14 +105,21 @@ def parse_dataset(text: str) -> list[dict]:
 
 
 def encode_examples(tok, rows: list[dict], seq_len: int) -> list[tuple[list[int], list[int]]]:
+    """(input_ids, labels) pairs. Chats are trained on their last assistant reply only (the rest is
+    masked with -100); a chat without any assistant reply, and plain text, is trained on every token."""
     examples = []
     has_tpl = bool(getattr(tok, "chat_template", None))
     for r in rows:
         if "messages" in r:
-            msgs = r["messages"]
+            msgs = [m for m in r["messages"] if isinstance(m, dict) and "content" in m]
+            if not msgs:
+                continue
+            last = max((i for i, m in enumerate(msgs) if m.get("role") == "assistant"), default=None)
+            if last is not None:
+                msgs = msgs[:last + 1]  # turns after the last reply have no target
             if has_tpl:
                 full = tok.apply_chat_template(msgs, tokenize=False, enable_thinking=False)
-                if msgs and msgs[-1].get("role") == "assistant":
+                if last is not None:
                     prompt = tok.apply_chat_template(msgs[:-1], tokenize=False, add_generation_prompt=True,
                                                      enable_thinking=False)
                 else:
@@ -120,9 +127,15 @@ def encode_examples(tok, rows: list[dict], seq_len: int) -> list[tuple[list[int]
                 fid = tok(full, add_special_tokens=False)["input_ids"]
                 pid = tok(prompt, add_special_tokens=False)["input_ids"] if prompt else []
             else:
-                body = "\n".join(f"{m['role']}: {m['content']}" for m in msgs[:-1])
-                fid = tok(body + f"\nassistant: {msgs[-1]['content']}")["input_ids"]
-                pid = tok(body + "\nassistant:")["input_ids"]
+                turns = [f"{m.get('role', 'user')}: {m['content']}" for m in msgs]
+                if last is not None:
+                    body = "\n".join(turns[:-1])
+                    head = (body + "\n" if body else "") + "assistant:"
+                    fid = tok(f"{head} {msgs[-1]['content']}")["input_ids"]
+                    pid = tok(head)["input_ids"]
+                else:
+                    fid = tok("\n".join(turns))["input_ids"]
+                    pid = []
             k = 0
             while k < min(len(pid), len(fid)) and pid[k] == fid[k]:
                 k += 1
@@ -194,11 +207,11 @@ def select_modules(rt, targets: list[str], layers: str) -> list[str]:
 
 def ensure_lora(rt, names: list[str], r: int, alpha: float, dropout: float) -> dict:
     if rt.lora is None:
-        rt.lora = {"wrappers": {}, "r": r, "alpha": alpha, "enabled": True, "steps": 0}
+        rt.lora = {"wrappers": {}, "r": r, "alpha": alpha, "dropout": dropout, "enabled": True, "steps": 0}
     lo = rt.lora
     if lo["r"] != r or lo["alpha"] != alpha:
         raise RuntimeError(f"既存のLoRA (r={lo['r']}, alpha={lo['alpha']}) と設定が違います。"
-                           "「LoRAをリセット」してから開始してください")
+                           "「リセット」してから開始してください")
     for name in names:
         if name in lo["wrappers"]:
             continue
@@ -222,14 +235,29 @@ def reset_lora(rt) -> None:
         parent_name, child = name.rsplit(".", 1)
         setattr(rt.model.get_submodule(parent_name), child, w.base)
     rt.lora = None
+    rt.unsaved = False
     rt._free_cuda()
+
+
+def _check_out_dir(rt, out_dir: str, need_bytes: int) -> Path:
+    out = Path(out_dir).expanduser().resolve()
+    if rt.model_dir and out == Path(rt.model_dir).resolve():
+        raise RuntimeError("元のモデルのフォルダには保存できません")
+    if out.exists() and any(out.iterdir()):
+        raise RuntimeError(f"保存先が空ではありません: {out}")
+    out.mkdir(parents=True, exist_ok=True)
+    free = shutil.disk_usage(out).free
+    if free < need_bytes * 1.05 + 2**26:
+        raise RuntimeError(f"保存先の空き容量が足りません（必要 約{need_bytes / 2**30:.2f} GB / 空き {free / 2**30:.2f} GB）: {out}")
+    return out
 
 
 def save_lora(rt, out_dir: str) -> str:
     from safetensors.torch import save_file
     if not rt.lora:
         raise RuntimeError("保存するLoRAがありません")
-    os.makedirs(out_dir, exist_ok=True)
+    need = sum((w.lora_A.numel() + w.lora_B.numel()) * 4 for w in rt.lora["wrappers"].values())
+    out_dir = str(_check_out_dir(rt, out_dir, need))
     tensors = {}
     for name, w in rt.lora["wrappers"].items():
         tensors[f"base_model.model.{name}.lora_A.weight"] = w.lora_A.detach().float().cpu().contiguous()
@@ -237,13 +265,68 @@ def save_lora(rt, out_dir: str) -> str:
     save_file(tensors, os.path.join(out_dir, "adapter_model.safetensors"))
     cfg = {
         "peft_type": "LORA", "task_type": "CAUSAL_LM", "r": rt.lora["r"],
-        "lora_alpha": rt.lora["alpha"], "lora_dropout": 0.0, "bias": "none",
+        "lora_alpha": rt.lora["alpha"], "lora_dropout": rt.lora.get("dropout", 0.0), "bias": "none",
         "target_modules": sorted({n.split(".")[-1] for n in rt.lora["wrappers"]}),
         "base_model_name_or_path": rt.model_dir,
     }
     with open(os.path.join(out_dir, "adapter_config.json"), "w", encoding="utf-8") as fh:
         json.dump(cfg, fh, indent=2, ensure_ascii=False)
     return out_dir
+
+
+def save_full(rt, out_dir: str) -> str:
+    """Write the fully fine-tuned model as a copy of the original checkpoint folder.
+
+    Every shard is rewritten with the same tensor names, dtypes and sharding as the
+    original; only the trained matrices are replaced (cast back to their stored dtype).
+    Tokenizer / config files are copied, so the result opens in AITrainView and in
+    transformers like the original model.
+    """
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+    if not rt.full or not rt.full["modules"]:
+        raise RuntimeError("保存するフル微調整の結果がありません")
+    src = Path(rt.model_dir)
+    names = {t["id"]: t["name"] for t in rt.structure["tensors"]}
+    changed = {}  # checkpoint tensor name -> live parameter
+    for mod in rt.full["modules"]:
+        tid = rt.mod_tid.get(mod)
+        if tid is not None:
+            changed[names[tid]] = rt.model.get_submodule(mod).weight
+    index = src / "model.safetensors.index.json"
+    if index.exists():
+        shards = sorted({src / f for f in json.loads(index.read_text(encoding="utf-8"))["weight_map"].values()})
+    else:
+        shards = sorted(src.glob("*.safetensors"))
+    out = _check_out_dir(rt, out_dir, sum(f.stat().st_size for f in shards))
+
+    written = set()
+    for f in shards:
+        tensors = {}
+        with safe_open(str(f), framework="pt") as fh:
+            meta = fh.metadata() or {"format": "pt"}
+            for k in fh.keys():
+                t = fh.get_tensor(k)
+                w = changed.get(k)
+                if w is not None:
+                    if tuple(w.shape) != tuple(t.shape):
+                        raise RuntimeError(f"{k}: 形状が一致しません {tuple(w.shape)} != {tuple(t.shape)}")
+                    t = w.detach().to("cpu", t.dtype).contiguous()
+                    written.add(k)
+                tensors[k] = t
+        save_file(tensors, str(out / f.name), metadata=meta)
+        del tensors
+    if set(changed) - written:
+        raise RuntimeError(f"チェックポイントに見つからない行列があります: {sorted(set(changed) - written)[:3]}")
+
+    weights = (".safetensors", ".bin", ".pt", ".pth", ".gguf", ".h5", ".msgpack", ".onnx", ".ckpt")
+    for f in src.iterdir():  # config, tokenizer, chat template, generation config, index ...
+        if f.is_file() and not f.name.endswith(weights) and f.stat().st_size < 64 * 2**20:
+            shutil.copy2(f, out / f.name)
+    info = {"base_model": str(src), "method": "full", "steps": rt.full["steps"],
+            "trained_tensors": sorted(changed), "saved_at": time.strftime("%Y-%m-%d %H:%M:%S")}
+    (out / "aitrainview_finetune.json").write_text(json.dumps(info, indent=2, ensure_ascii=False), encoding="utf-8")
+    return str(out)
 
 
 # --------------------------------------------------------------- telemetry
@@ -283,6 +366,8 @@ def run_training(rt, req: dict) -> bool:
     bus = rt.bus
     model, tok, dev = rt.model, rt.tok, rt.device
     oom = False
+    done = 0  # optimizer steps actually taken (the weights / LoRA changed)
+    names: list[str] = []
     try:
         method = req.get("method", "lora")
         steps = int(req.get("steps", 60))
@@ -309,6 +394,8 @@ def run_training(rt, req: dict) -> bool:
             raise ValueError("学習対象の行列が見つかりません（targets / layers を確認してください）")
 
         if method == "lora":
+            if rt.full:
+                raise ValueError("フル微調整の結果が残っています。保存するか「元に戻す」をしてから LoRA を学習してください")
             wrappers = ensure_lora(rt, names, int(req.get("rank", 8)), float(req.get("alpha", 16)),
                                    float(req.get("dropout", 0.0)))
             tracked = [(n, rt.mod_tid[n], wrappers[n]) for n in names]
@@ -337,9 +424,6 @@ def run_training(rt, req: dict) -> bool:
         use_scaler = rt.dtype == torch.float16 and dev.type == "cuda"
         scaler = torch.amp.GradScaler("cuda") if use_scaler else None
         pad_id = tok.pad_token_id if tok.pad_token_id is not None else (tok.eos_token_id or 0)
-        extra = {}
-        if "token_type_ids" in inspect.signature(model.forward).parameters:
-            extra["token_type_ids"] = None
 
         bus.publish({
             "type": "train_start", "method": method, "steps": steps, "modules": len(tracked),
@@ -392,14 +476,14 @@ def run_training(rt, req: dict) -> bool:
             for g in opt.param_groups:
                 g["lr"] = lr
             ts = time.time()
-            out = model(input_ids=ids, attention_mask=mask, labels=lab, **extra)
+            out = model(input_ids=ids, attention_mask=mask, labels=lab)
             loss = out.loss
             del out
             if not torch.isfinite(loss):
+                # an overflow in the forward pass: loss scaling only affects backward, so the
+                # GradScaler is left alone (updating it before any scale() call would raise)
                 opt.zero_grad(set_to_none=True)
                 bus.publish({"type": "train_step", "step": step, "loss": None, "lr": lr, "skipped": True})
-                if scaler:
-                    scaler.update(scaler.get_scale() / 2)
                 continue
             (scaler.scale(loss) if scaler else loss).backward()
             if scaler:
@@ -420,6 +504,8 @@ def run_training(rt, req: dict) -> bool:
             else:
                 opt.step()
             opt.zero_grad(set_to_none=True)
+            done += 1
+            rt.unsaved = True
             if rt.lora is not None and method == "lora":
                 rt.lora["steps"] = rt.lora.get("steps", 0) + 1
             tok_count += ntok
@@ -451,6 +537,11 @@ def run_training(rt, req: dict) -> bool:
             if req.get("method", "lora") != "lora":
                 for p in model.parameters():
                     p.requires_grad_(False)
+                if done:  # the weights were changed in place: remember what, so it can be saved
+                    if rt.full is None:
+                        rt.full = {"modules": set(), "steps": 0}
+                    rt.full["modules"].update(names)
+                    rt.full["steps"] += done
         except Exception:
             pass
         rt.busy = None

@@ -18,8 +18,19 @@ from .events import Bus
 
 STRIP = {"model", "language_model", "base_model", "transformer", "text_model"}
 MAX_ATTN_TOKENS = 256
+# The 3D activation blocks are ACT_P x ACT_T textures; the frontend checks these
+# against its own copies (flowLayout.ts) when it connects.
 ACT_P = 256  # channels kept per activation row (adaptive average pooling)
 ACT_T = 128  # tokens streamed to the 3D activation blocks
+DEFAULT_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+
+def bf16_supported(torch) -> bool:
+    """Native bf16 only (emulated bf16 on e.g. Turing is far slower than fp16 / fp32)."""
+    try:
+        return torch.cuda.is_bf16_supported(including_emulation=False)
+    except TypeError:
+        return torch.cuda.get_device_capability()[0] >= 8
 
 
 def norm_name(n: str) -> str:
@@ -40,11 +51,7 @@ def _pick_dtype(torch, pref: str, model_type: str, device: str):
         return torch.bfloat16
     if device == "cpu":
         return torch.float32
-    try:
-        bf16 = torch.cuda.is_bf16_supported(including_emulation=False)
-    except TypeError:
-        bf16 = torch.cuda.get_device_capability()[0] >= 8
-    if bf16:
+    if bf16_supported(torch):
         return torch.bfloat16
     if "gemma" in (model_type or ""):
         return torch.float32  # Gemma overflows in fp16
@@ -68,7 +75,10 @@ class Runtime:
         self.layer_mods: dict[int, str] = {}
         self.final_norm_name: str | None = None
         self.head_name: str | None = None
-        self.lora: dict | None = None  # {"wrappers": {name: LoRALinear}, r, alpha, enabled}
+        self.lora: dict | None = None  # {"wrappers": {name: LoRALinear}, r, alpha, dropout, enabled, steps}
+        self.full: dict | None = None  # full fine-tune applied in place: {"modules": set(names), "steps": n}
+        self.unsaved = False  # trained since the last save / reset / load
+        self._load_args: tuple = ()
         self.attn: dict | None = None
         self._acts: dict = {}
         self._layer_out: dict = {}
@@ -89,6 +99,10 @@ class Runtime:
                     "alpha": self.lora["alpha"], "enabled": self.lora["enabled"],
                     "steps": self.lora.get("steps", 0),
                 },
+                "full": None if not self.full else {
+                    "modules": len(self.full["modules"]), "steps": self.full["steps"],
+                },
+                "unsaved": self.unsaved,
             })
             if torch.cuda.is_available() and self.device and self.device.type == "cuda":
                 d["vram_used"] = torch.cuda.memory_allocated() / 2**30
@@ -111,9 +125,16 @@ class Runtime:
         threading.Thread(target=self.load, args=(model_dir, structure, dtype_pref, device_pref),
                          daemon=True).start()
 
+    def reload(self) -> None:
+        """Throw away in-place changes (full fine-tune) by loading the weights from disk again."""
+        if not self._load_args:
+            raise RuntimeError("モデルが読み込まれていません")
+        self.start_load(*self._load_args)
+
     def load(self, model_dir: str, structure: dict, dtype_pref: str = "auto", device_pref: str = "auto"):
         """Runs on its own thread; call start_load() to claim the runtime first."""
         self._drop()
+        self._load_args = (model_dir, structure, dtype_pref, device_pref)
         self.error = None
         self._emit_state("loading", "torch を読み込み中…")
         oom = False
@@ -208,6 +229,8 @@ class Runtime:
         self.model = None
         self.tok = None
         self.lora = None
+        self.full = None
+        self.unsaved = False
         self.attn = None
         self.mod_tid = {}
         self.layer_mods = {}
@@ -242,6 +265,15 @@ class Runtime:
             self.require_ready()
             self.busy = kind
             self.stop_event.clear()
+
+    def exclusive(self, kind: str, fn):
+        """Run fn() while holding the runtime (e.g. saving / resetting): no inference or training meanwhile."""
+        self._claim(kind)
+        try:
+            return fn()
+        finally:
+            self.busy = None
+            self.bus.publish({"type": "runtime", "state": self.state, "info": self.info()})
 
     def chat_text(self, prompt: str) -> str:
         msgs = [{"role": "user", "content": prompt}]
@@ -391,6 +423,7 @@ class Runtime:
         import torch
         handles = []
         oom = False
+        lora_was = self.lora["enabled"] if self.lora else None
         try:
             tok, model, dev = self.tok, self.model, self.device
             prompt = req.get("prompt", "")
@@ -398,7 +431,7 @@ class Runtime:
             text = self.chat_text(prompt) if use_chat else prompt
             enc = tok(text, return_tensors="pt", add_special_tokens=not use_chat)
             ids = enc["input_ids"].to(dev)
-            if self.lora:
+            if self.lora:  # only for this generation; training and saving keep their own state
                 self.set_lora_enabled(req.get("lora", True))
             max_new = int(req.get("max_new_tokens", 64))
             temperature = float(req.get("temperature", 0.0))
@@ -508,6 +541,8 @@ class Runtime:
         finally:
             for h in handles:
                 h.remove()
+            if lora_was is not None and self.lora:
+                self.set_lora_enabled(lora_was)
             self._acts.clear()  # these hold GPU tensors of the last step
             self._layer_out.clear()
             self._cap.clear()
