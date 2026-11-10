@@ -1,0 +1,10 @@
+node_modules/
+.venv/
+frontend/dist/
+outputs/
+__pycache__/
+*.pyc
+# machine-local cargo config (target dir on D:)
+.cargo/
+src-tauri/target/
+src-tauri/gen/

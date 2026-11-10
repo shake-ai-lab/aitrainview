@@ -1,0 +1,8 @@
+# torch は CUDA 版を別途入れる:
+#   uv pip install torch --index-url https://download.pytorch.org/whl/cu126
+numpy
+safetensors
+huggingface_hub
+transformers>=4.56
+fastapi
+uvicorn[standard]
