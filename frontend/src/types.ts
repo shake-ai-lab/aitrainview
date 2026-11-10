@@ -64,6 +64,8 @@ export interface RuntimeInfo {
   vram_used?: number;
   vram_total?: number;
   lora?: { modules: number; r: number; alpha: number; enabled: boolean; steps: number } | null;
+  full?: { modules: number; steps: number } | null; // full fine-tune applied to the loaded weights
+  unsaved?: boolean; // trained since the last save / reset
 }
 
 export interface InferStep {

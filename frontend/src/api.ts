@@ -1,14 +1,15 @@
 // REST + WebSocket client.
 //  * browser / Vite dev server: same origin (Vite proxies /api and /ws, or the
 //    Python backend serves the built frontend itself)
-//  * Tauri app: the page comes from the app bundle (tauri.localhost), so the
-//    backend is addressed explicitly; it allows that origin via CORS. The shell
-//    injects the port it started the backend on (AITV_PORT) as __AITV_PORT__.
+//  * Tauri app: the shell injects the port it started the backend on as
+//    __AITV_PORT__ (it may differ from 8765 when that port is taken), and the
+//    backend is addressed directly; it allows the app's origin via CORS.
 
 const params = new URLSearchParams(location.search);
 const inTauriBundle = location.hostname === 'tauri.localhost' || location.protocol === 'tauri:';
-const port = Number((window as any).__AITV_PORT__) || 8765;
-export const API_BASE = params.get('api') ?? (inTauriBundle ? `http://127.0.0.1:${port}` : '');
+const injectedPort = Number((window as any).__AITV_PORT__) || 0;
+export const API_BASE = params.get('api')
+  ?? (injectedPort ? `http://127.0.0.1:${injectedPort}` : inTauriBundle ? 'http://127.0.0.1:8765' : '');
 const WS_URL = API_BASE
   ? `${API_BASE.replace(/^http/, 'ws')}/ws`
   : `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`;
@@ -55,10 +56,27 @@ export const api = {
   },
 };
 
+/** What the desktop shell knows about the backend process (see backend_status in main.rs). */
+export interface BackendStatus {
+  port: number;
+  reused: boolean;
+  running: boolean;
+  exit_code: number | null;
+  error: string | null;
+  log: string | null;
+  log_tail: string | null;
+  python: string | null;
+  root: string | null;
+}
+
 /** Native features when running inside the Tauri app (null in a plain browser). */
 const tauri = (window as any).__TAURI__;
 export const desktop = tauri
-  ? { pickFolder: (): Promise<string | null> => tauri.core.invoke('pick_folder') }
+  ? {
+    pickFolder: (title?: string): Promise<string | null> => tauri.core.invoke('pick_folder', { title }),
+    backendStatus: (): Promise<BackendStatus> => tauri.core.invoke('backend_status'),
+    restartBackend: (): Promise<void> => tauri.core.invoke('restart_backend'),
+  }
   : null;
 
 type Handler = (msg: any, payload?: Uint8Array) => void;
@@ -105,6 +123,5 @@ export class EventSocket {
         console.error('[AITrainView] handler error', msg.type, e);
       }
     }
-    for (const fn of this.handlers.get('*') ?? []) fn(msg, payload);
   }
 }

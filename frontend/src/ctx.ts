@@ -23,6 +23,10 @@ export interface AppCtx {
   rel: Map<number, number>; // latest ||ΔW|| / ||W|| per tensor
   acts: Map<number, number>; // latest activation RMS per tensor
   toast(msg: string, level?: 'info' | 'ok' | 'error'): void;
+  /** Ask before an action that throws away unsaved training results; true = go ahead. */
+  confirmDiscard(action: string): Promise<boolean>;
+  /** Training results were undone: forget ΔW / gradients in the view and the panels. */
+  clearTrainingView(): void;
   select(tid: number): void;
   setView(v: 'weights' | 'delta'): void;
   setActivityMode(mode: 'none' | 'inference' | 'training'): void;

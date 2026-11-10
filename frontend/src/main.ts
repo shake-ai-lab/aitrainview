@@ -1,8 +1,8 @@
 import './style.css';
-import { api, desktop, EventSocket } from './api';
+import { api, type BackendStatus, desktop, EventSocket } from './api';
 import type { AppCtx, Settings } from './ctx';
 import { COLORMAPS, cssGradient } from './scene/colormaps';
-import { ACT_P } from './scene/flowLayout';
+import { ACT_P, ACT_T } from './scene/flowLayout';
 import { ModelView } from './scene/modelView';
 import { Viewer } from './scene/viewer';
 import type { RuntimeInfo, Structure } from './types';
@@ -41,6 +41,13 @@ class App implements AppCtx {
   // display controls of the left panel; re-applied whenever the 3D view is rebuilt
   private display = { brightness: 0.9, deltaGain: 1, deltaNorm: 'global' as 'global' | 'per-tensor', labels: true };
   private tokens: string[] = []; // prompt + generated tokens of the current inference
+  // what the last inference / training wrote into the 3D view, re-applied when the
+  // view is rebuilt (layout switch); the backend only streams it once
+  private actFrames: { attn: boolean; m: any; payload: Uint8Array }[] = [];
+  private actBytes = 0;
+  private actTokens = 0;
+  private lastLens: [string, number][][] | null = null;
+  private deltaTiles = new Map<number, { size: number; bytes: Uint8Array; scale: number }>();
   grads = new Map<number, number>();
   rel = new Map<number, number>();
   acts = new Map<number, number>();
@@ -53,7 +60,12 @@ class App implements AppCtx {
   private loadText = h('span', { class: 'load-text' });
   private sourceInput = h('input', { type: 'text', placeholder: 'HF のモデルID（例: Qwen/Qwen3-0.6B）またはローカルフォルダのパス', spellcheck: false }) as HTMLInputElement;
   private tokenInput = h('input', { type: 'password', placeholder: 'HFトークン（Gemma など規約同意が必要なモデル用・任意）' }) as HTMLInputElement;
+  private topTokenInput = h('input', { type: 'password', placeholder: 'HFトークン（規約同意が必要なモデル用）' }) as HTMLInputElement;
   private openBtn = h('button', { class: 'primary', onclick: () => this.open(this.sourceInput.value) }, '開く');
+  private backendBox = h('div', { class: 'backend-error' });
+  private connected = false;
+  private backendTimer = 0;
+  private backendChecks = 0;
   private sysInfo = h('span', { class: 'sys' });
   private conn = h('span', { class: 'conn' });
   private modelInfo = h('div', { class: 'model-info' });
@@ -81,6 +93,7 @@ class App implements AppCtx {
       this.tooltip,
       this.toasts,
       this.welcome,
+      this.backendBox,
     );
     this.viewer.onHover = (idx, x, y, uv) => this.hover(idx, x, y, uv);
     this.viewer.onSelect = (idx) => {
@@ -105,9 +118,16 @@ class App implements AppCtx {
     const pick = desktop
       ? h('button', { onclick: () => this.pickFolder(), title: 'フォルダを選択' }, '📁')
       : null;
+    // one token, two inputs (start screen and top bar)
+    this.tokenInput.addEventListener('input', () => (this.topTokenInput.value = this.tokenInput.value));
+    this.topTokenInput.addEventListener('input', () => (this.tokenInput.value = this.topTokenInput.value));
+    this.topTokenInput.addEventListener('keydown', (e) => e.key === 'Enter' && this.open(this.sourceInput.value));
+    const token = h('details', { class: 'token-pop' },
+      h('summary', { title: 'HFトークン（Gemma など規約同意が必要なモデル用）' }, '🔑'),
+      h('div', { class: 'pop' }, this.topTokenInput));
     return h('header', { class: 'topbar' },
       h('div', { class: 'brand' }, h('span', { class: 'logo' }, '◆'), 'AITrainView'),
-      h('div', { class: 'source' }, this.sourceInput, pick, this.openBtn),
+      h('div', { class: 'source' }, this.sourceInput, pick, token, this.openBtn),
       this.loadText,
       h('div', { class: 'spacer' }),
       this.sysInfo,
@@ -262,6 +282,7 @@ class App implements AppCtx {
   private async open(source: string): Promise<void> {
     source = source.trim();
     if (!source) return;
+    if (this.structure && !(await this.confirmDiscard('別のモデルを開く'))) return;
     this.openBtn.disabled = true;
     this.loadText.textContent = `${source} を開いています…`;
     this.welcome.classList.add('busy');
@@ -288,11 +309,14 @@ class App implements AppCtx {
 
   private setStructure(st: Structure, keepState = false): void {
     this.structure = st;
+    const keepTid = keepState ? this.inspect.current : -1;
     if (!keepState) {
       this.grads.clear();
       this.rel.clear();
       this.acts.clear();
       this.tokens = [];
+      this.forgetActivations();
+      this.deltaTiles.clear();
     }
     const view = new ModelView(st, this.settings.layout);
     this.view = view;
@@ -307,10 +331,125 @@ class App implements AppCtx {
     this.welcome.style.display = 'none';
     this.sourceInput.value = st.name;
     this.renderModelInfo();
-    this.inspect.renderEmpty();
+    if (keepState) this.replayInto(view);
+    if (keepTid >= 0) { // keep the selection, without switching away from the tab in use
+      view.setSelected(view.placementsOf(keepTid)[0] ?? -1);
+      this.inspect.show(keepTid);
+    } else this.inspect.renderEmpty();
     this.layerSlider.max = String(Math.max(0, (view.layout.towers[0]?.floors.length ?? 1) - 1));
     this.layerSlider.value = '0';
     this.loadAtlas();
+  }
+
+  private forgetActivations(): void {
+    this.actFrames = [];
+    this.actBytes = 0;
+    this.actTokens = 0;
+    this.lastLens = null;
+  }
+
+  /** Re-apply ΔW tiles and the last inference's activations to a freshly built view. */
+  private replayInto(view: ModelView): void {
+    if (this.deltaTiles.size) {
+      const S = view.tile;
+      const ids: number[] = [];
+      const scales: number[] = [];
+      const buf = new Uint8Array(this.deltaTiles.size * S * S);
+      for (const [tid, d] of this.deltaTiles) {
+        buf.set(d.size === S ? d.bytes : resizeNearest(d.bytes, d.size, S), ids.length * S * S);
+        ids.push(tid);
+        scales.push(d.scale);
+      }
+      view.setTiles(ids, buf, 'delta', S);
+      view.setDeltaScales(ids, scales);
+    }
+    if (this.actFrames.length) {
+      for (const f of this.actFrames) {
+        if (f.attn) view.writeAttention(f.m.q0, f.m.nq, f.m.nk, f.m.L, f.m.H, f.payload);
+        else view.writeActivations(f.m.t0, f.m.nt, f.m.entries, f.payload);
+      }
+      view.setTokens(this.tokens.slice(0, this.actTokens));
+    }
+    if (this.lastLens) view.setLens(this.lastLens);
+  }
+
+  private recordActivations(attn: boolean, m: any, payload: Uint8Array): void {
+    if (this.actBytes > 96 * 2 ** 20) return; // a very long generation: replay only the beginning
+    this.actFrames.push({ attn, m, payload });
+    this.actBytes += payload.byteLength;
+  }
+
+  async confirmDiscard(action: string): Promise<boolean> {
+    const rt = this.runtime;
+    if (!rt?.unsaved) return true;
+    const what = rt.full ? 'フル微調整した重み' : '学習した LoRA';
+    try {
+      // in the desktop app the dialog plugin turns window.confirm into an async native message box
+      return !!(await window.confirm(`${what}はまだ保存されていません。${action}と失われます。続けますか？`));
+    } catch (e) {
+      console.error('[AITrainView] confirm failed', e);
+      return false; // could not ask: keep the results
+    }
+  }
+
+  clearTrainingView(): void {
+    this.deltaTiles.clear();
+    this.view?.clearDelta();
+    this.rel.clear();
+    this.grads.clear();
+    if (this.inspect.current >= 0) this.inspect.renderDelta();
+  }
+
+  // ------------------------------------------------------------- backend
+  /** The desktop shell could not get a backend running: say why instead of "not connected". */
+  private async checkBackend(): Promise<void> {
+    this.backendTimer = 0;
+    if (this.connected || !desktop) return;
+    let st: BackendStatus;
+    try {
+      st = await desktop.backendStatus();
+    } catch {
+      return;
+    }
+    if (this.connected) return;
+    this.backendChecks++;
+    const starting = st.running && !st.error;
+    if (starting) {
+      this.backendTimer = window.setTimeout(() => this.checkBackend(), 4000);
+      if (this.backendChecks < 4) return; // importing torch etc. can take a while
+    }
+    const reason = st.error
+      ?? (starting ? `バックエンドがまだ応答しません（ポート ${st.port}）`
+        : `バックエンドが終了しました${st.exit_code !== null ? `（終了コード ${st.exit_code}）` : ''}`);
+    const parts: (HTMLElement | null)[] = [
+      h('div', { class: 'title' }, starting ? 'バックエンドの起動を待っています' : 'バックエンドを起動できませんでした'),
+      h('div', {}, reason),
+      h('div', { class: 'kv small' },
+        st.python ? [h('span', {}, 'Python'), h('b', {}, st.python)] : null,
+        st.root ? [h('span', {}, 'backend'), h('b', {}, st.root)] : null,
+        st.log ? [h('span', {}, 'ログ'), h('b', {}, st.log)] : null),
+      st.log_tail ? h('pre', {}, st.log_tail.trimEnd().split('\n').slice(-14).join('\n')) : null,
+      h('div', { class: 'muted small' },
+        'Python 3.10 以上と backend/requirements.txt の依存（GPU で推論・学習するなら CUDA 版 torch も）が入った環境が必要です。',
+        'プロジェクト直下の .venv、~/.aitrainview/venv の順に探します。別の場所なら環境変数 AITV_PYTHON にその python を指定してください。'),
+      h('div', { class: 'row' },
+        h('button', { class: 'primary', onclick: () => this.restartBackend() }, 'バックエンドを再起動'),
+        h('button', { onclick: () => this.backendBox.classList.remove('on') }, '閉じる')),
+    ];
+    this.backendBox.replaceChildren(...(parts.filter(Boolean) as HTMLElement[]));
+    this.backendBox.classList.add('on');
+  }
+
+  private async restartBackend(): Promise<void> {
+    this.backendBox.classList.remove('on');
+    this.backendChecks = 0;
+    try {
+      await desktop?.restartBackend();
+    } catch (e) {
+      this.toast(String(e), 'error');
+    }
+    window.clearTimeout(this.backendTimer);
+    this.backendTimer = window.setTimeout(() => this.checkBackend(), 4000);
   }
 
   private renderModelInfo(): void {
@@ -446,10 +585,25 @@ class App implements AppCtx {
   private wireSocket(): void {
     const s = this.sock;
     s.onConnection = (up) => {
+      this.connected = up;
       this.conn.textContent = up ? '● 接続中' : '○ バックエンド未接続';
       this.conn.className = `conn ${up ? 'up' : 'down'}`;
-      if (up && !this.structure) this.init();
+      if (up) {
+        this.backendBox.classList.remove('on');
+        this.backendChecks = 0;
+        window.clearTimeout(this.backendTimer);
+        this.backendTimer = 0;
+        if (!this.structure) this.init();
+      } else if (desktop && !this.backendTimer) {
+        this.backendTimer = window.setTimeout(() => this.checkBackend(), 3000);
+      }
     };
+    s.on('hello', (m) => {
+      const l = m.limits;
+      if (l && (l.act_p !== ACT_P || l.act_t !== ACT_T)) {
+        this.toast(`バックエンドとフロントエンドの版が合っていません（活性ブロック ${l.act_p}×${l.act_t} と ${ACT_P}×${ACT_T}）。同じ版に揃えてください`, 'error');
+      }
+    });
     s.on('status', (m) => this.toast(m.message, m.level === 'error' ? 'error' : 'info'));
     s.on('download', (m) => {
       this.loadText.textContent = `ダウンロード中 ${fmtBytes(m.bytes)}${m.total ? ` / ${fmtBytes(m.total)}` : ''}`;
@@ -476,26 +630,51 @@ class App implements AppCtx {
     s.on('runtime', (m) => {
       if (m.state === 'error') this.toast(`モデルの読み込みに失敗: ${m.message}`, 'error');
       else if (m.state === 'ready' && m.message) this.toast(m.message, 'ok');
+      // (re)loading drops every LoRA / in-place change: the ΔW shown would be stale
+      if (m.state === 'loading' && (this.deltaTiles.size || this.rel.size)) this.clearTrainingView();
     });
-    s.on('train_delta', () => {
+    s.on('train_delta', (m, payload) => {
+      if (payload) {
+        const S2 = m.size * m.size;
+        m.ids.forEach((tid: number, k: number) =>
+          this.deltaTiles.set(tid, { size: m.size, bytes: payload.slice(k * S2, (k + 1) * S2), scale: m.scales[k] }));
+      }
       if (this.inspect.current >= 0 && this.view?.hasDelta(this.inspect.current)) this.inspect.renderDelta();
     });
     // live activations: every forward pass writes token rows into the activation blocks
     s.on('infer_start', (m) => {
       this.tokens = [...m.prompt_tokens];
+      this.forgetActivations();
       this.view?.resetActivations([]);
     });
-    s.on('infer_step', (m) => this.tokens.push(m.token));
+    s.on('infer_step', (m) => {
+      this.tokens.push(m.token);
+      this.lastLens = m.lens;
+    });
     s.on('infer_acts', (m, payload) => {
-      if (!this.view || !payload) return;
+      if (!payload) return;
+      this.recordActivations(false, m, payload);
+      this.actTokens = Math.max(this.actTokens, m.t0 + m.nt);
+      if (!this.view) return;
       this.view.writeActivations(m.t0, m.nt, m.entries, payload);
       this.view.setTokens(this.tokens.slice(0, m.t0 + m.nt));
     });
     s.on('infer_attn', (m, payload) => {
-      if (!this.view || !payload) return;
-      this.view.writeAttention(m.q0, m.nq, m.nk, m.L, m.H, payload);
+      if (!payload) return;
+      this.recordActivations(true, m, payload);
+      this.view?.writeAttention(m.q0, m.nq, m.nk, m.L, m.H, payload);
     });
   }
+}
+
+/** Nearest-neighbour resize of an S×S uint8 tile (ΔW tiles when the layout uses another tile size). */
+function resizeNearest(src: Uint8Array, from: number, to: number): Uint8Array {
+  const out = new Uint8Array(to * to);
+  for (let y = 0; y < to; y++) {
+    const row = Math.floor((y * from) / to) * from;
+    for (let x = 0; x < to; x++) out[y * to + x] = src[row + Math.floor((x * from) / to)];
+  }
+  return out;
 }
 
 new App();

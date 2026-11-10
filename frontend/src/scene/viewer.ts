@@ -26,7 +26,11 @@ export class Viewer {
   model: ModelView | null = null;
   onHover?: (idx: number, x: number, y: number, uv: THREE.Vector2 | null) => void;
   onSelect?: (idx: number) => void;
-  bloomEnabled = true;
+  // Render on demand: a frame (with bloom) is drawn only when something changed —
+  // the camera, the model's textures / uniforms / animations, or the canvas size.
+  // This keeps the GPU free for inference and training on small cards.
+  private dirty = true;
+  private lastRender = 0;
 
   constructor(private container: HTMLElement) {
     const w = container.clientWidth || 800;
@@ -86,7 +90,13 @@ export class Viewer {
       if (p) this.focusOn(new THREE.Vector3(p.x, p.y, p.z), Math.max(2.2, Math.max(p.w, p.h) * 1.6));
     });
     window.addEventListener('keydown', (e) => this.onKey(e));
+    document.addEventListener('visibilitychange', () => this.invalidate());
     this.renderer.setAnimationLoop(() => this.frame());
+  }
+
+  /** Request a new frame (for changes the viewer cannot see by itself). */
+  invalidate(): void {
+    this.dirty = true;
   }
 
   private pickAt(cx: number, cy: number): number {
@@ -110,6 +120,7 @@ export class Viewer {
     const h = this.container.clientHeight;
     if (!w || !h) return;
     this.camera.setViewOffset(w, h, (this.insets.right - this.insets.left) / 2, 0, w, h);
+    this.dirty = true;
   }
 
   private freeFraction(): number {
@@ -147,6 +158,7 @@ export class Viewer {
     this.renderer.setSize(w, h);
     this.composer.setSize(w, h);
     this.labels.setSize(w, h);
+    this.dirty = true;
   }
 
   setModel(model: ModelView | null): void {
@@ -160,11 +172,12 @@ export class Viewer {
       this.grid.position.y = model.layout.min[1] - 0.4;
       this.goToFloor(0, true);
     }
+    this.dirty = true;
   }
 
   setBloom(on: boolean): void {
-    this.bloomEnabled = on;
     this.bloom.enabled = on;
+    this.dirty = true;
   }
 
   animateTo(target: THREE.Vector3, cam: THREE.Vector3, dur = 0.6): void {
@@ -211,6 +224,8 @@ export class Viewer {
 
   private frame(): void {
     const dt = Math.min(0.1, this.clock.getDelta());
+    if (document.hidden) return; // minimised / covered: nothing to draw
+    let changed = this.dirty;
     if (this.tween) {
       const tw = this.tween;
       tw.t = Math.min(1, tw.t + dt / tw.dur);
@@ -218,8 +233,9 @@ export class Viewer {
       this.controls.target.lerpVectors(tw.from, tw.to, k);
       this.camera.position.lerpVectors(tw.camFrom, tw.camTo, k);
       if (tw.t >= 1) this.tween = null;
+      changed = true;
     }
-    this.controls.update();
+    if (this.controls.update()) changed = true; // true while the camera moves (incl. damping)
     if (this.pointerDirty && this.model) {
       this.pointerDirty = false;
       this.raycaster.setFromCamera(this.pointer, this.camera);
@@ -229,6 +245,12 @@ export class Viewer {
       this.onHover?.(idx, this.pointerClient.x, this.pointerClient.y, uv);
     }
     this.model?.update(dt);
+    if (this.model?.takeDirty()) changed = true;
+    const now = performance.now();
+    // a slow refresh as a safety net for any change that forgot to ask for a frame
+    if (!changed && now - this.lastRender < 1000) return;
+    this.dirty = false;
+    this.lastRender = now;
     // always go through the composer: OutputPass does the sRGB conversion
     this.composer.render();
     this.labels.render(this.scene, this.camera);

@@ -133,6 +133,68 @@ input[type='checkbox'] {
 .source input {
   flex: 1;
 }
+.token-pop {
+  position: relative;
+}
+.token-pop summary {
+  list-style: none;
+  cursor: pointer;
+  padding: 4px 6px;
+  border: 1px solid var(--line-2);
+  border-radius: 6px;
+  user-select: none;
+}
+.token-pop summary::-webkit-details-marker {
+  display: none;
+}
+.token-pop .pop {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 25;
+  width: 300px;
+  padding: 8px;
+  background: var(--panel-solid);
+  border: 1px solid var(--line-2);
+  border-radius: 8px;
+}
+.token-pop .pop input {
+  width: 100%;
+}
+.backend-error {
+  position: fixed;
+  top: 58px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 40;
+  width: min(720px, 94vw);
+  display: none;
+  flex-direction: column;
+  gap: 8px;
+  padding: 14px 16px;
+  background: var(--panel-solid);
+  border: 1px solid var(--err);
+  border-radius: 10px;
+}
+.backend-error.on {
+  display: flex;
+}
+.backend-error .title {
+  font-weight: 700;
+  color: var(--err);
+}
+.backend-error pre {
+  margin: 0;
+  max-height: 220px;
+  overflow: auto;
+  font: 11px/1.4 var(--mono);
+  background: #05070b;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 6px 8px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
 .load-text {
   color: var(--muted);
   font-size: 12px;
@@ -184,6 +246,9 @@ input[type='checkbox'] {
 .stage {
   position: absolute;
   inset: 0;
+  /* own stacking context: CSS2DRenderer gives every label a depth z-index, which
+     would otherwise put labels on top of the side panels (z-index 3) */
+  isolation: isolate;
 }
 .stage canvas {
   display: block;

@@ -74,18 +74,21 @@ export class InferPanel {
     };
     this.status.textContent = text[st] ?? st;
     this.status.className = `rt-status ${st}`;
-    if (info?.busy) this.status.textContent += `（${info.busy === 'training' ? '学習中' : '推論中'}）`;
+    const busy: Record<string, string> = { training: '学習中', inference: '推論中', saving: '保存中', reset: 'リセット中' };
+    if (info?.busy) this.status.textContent += `（${busy[info.busy] ?? info.busy}）`;
     const ready = st === 'ready';
     this.loadBtn.disabled = st === 'loading' || !!info?.busy;
     this.loadBtn.textContent = ready ? '再読み込み' : 'GPUに読み込む';
     this.unloadBtn.disabled = !ready || !!info?.busy;
     this.runBtn.disabled = !ready || !!info?.busy;
-    this.stopBtn.disabled = !info?.busy;
+    this.stopBtn.disabled = info?.busy !== 'inference' && info?.busy !== 'training';
+    // "use the LoRA" is a per-generation choice: keep what the user picked, default on for a new LoRA
+    if (info?.lora && this.loraRow.style.display === 'none') this.lora.checked = true;
     this.loraRow.style.display = info?.lora ? '' : 'none';
-    if (info?.lora) this.lora.checked = info.lora.enabled;
   }
 
   private async load(): Promise<void> {
+    if (this.app.runtime?.state === 'ready' && !(await this.app.confirmDiscard('モデルを読み込み直す'))) return;
     try {
       await api.post('/api/runtime/load', { dtype: this.dtype.value });
       this.setRuntime({ state: 'loading' });
@@ -95,6 +98,7 @@ export class InferPanel {
   }
 
   private async unload(): Promise<void> {
+    if (!(await this.app.confirmDiscard('モデルを解放する'))) return;
     try {
       await api.post('/api/runtime/unload');
     } catch (e) {

@@ -271,6 +271,7 @@ export class ModelView {
   private itemLabels: CSS2DObject[] = [];
   private hoverIdx = -1;
   private selIdx = -1;
+  private dirty = true; // something visible changed since the last frame (see Viewer.frame)
   private deltaScales = new Map<number, number>();
   private deltaGlobal = 0;
   private actKeys = new Set<string>();
@@ -332,6 +333,13 @@ export class ModelView {
     this.buildSpine();
     this.buildConnectors();
     this.buildLabels();
+  }
+
+  /** True once after anything visible changed; the viewer then draws a frame. */
+  takeDirty(): boolean {
+    const d = this.dirty;
+    this.dirty = false;
+    return d;
   }
 
   private chunkOf(i: number): Chunk {
@@ -430,6 +438,7 @@ export class ModelView {
   // --------------------------------------------------------------- tiles
   /** Weight thumbnails (S×S each, ids order) into the atlas or delta textures. */
   setTiles(ids: number[], bytes: Uint8Array, target: 'atlas' | 'delta', size: number): void {
+    this.dirty = true;
     if (size !== this.tile) return;
     const S2 = this.tile * this.tile;
     const dirty = new Set<THREE.DataArrayTexture>();
@@ -444,6 +453,7 @@ export class ModelView {
   }
 
   applyDeltaScales(): void {
+    this.dirty = true;
     const P = this.layout.placements;
     for (const c of this.w.chunks) {
       const arr = c.aScale.array as Float32Array;
@@ -456,6 +466,7 @@ export class ModelView {
   }
 
   clearDelta(): void {
+    this.dirty = true;
     this.deltaScales.clear();
     for (const c of this.w.chunks) {
       if (!c.delta) continue;
@@ -481,6 +492,7 @@ export class ModelView {
   // --------------------------------------------------------- activations
   /** Start a new sequence: forget all activation data. */
   resetActivations(tokens: string[]): void {
+    this.dirty = true;
     this.actKeys.clear();
     for (const c of this.a.chunks) {
       (c.atlas.image.data as Uint8Array).fill(0);
@@ -492,6 +504,7 @@ export class ModelView {
 
   /** infer_acts frame: rows [t0, t0+nt) of many activation tiles. */
   writeActivations(t0: number, nt: number, entries: [string, number][], payload: Uint8Array): void {
+    this.dirty = true;
     const dirty = new Set<THREE.DataArrayTexture>();
     let off = 0;
     for (const [key, P] of entries) {
@@ -503,6 +516,7 @@ export class ModelView {
 
   /** infer_attn frame: [L, H, nq, nk] uint8 (√p). */
   writeAttention(q0: number, nq: number, nk: number, L: number, H: number, payload: Uint8Array): void {
+    this.dirty = true;
     const dirty = new Set<THREE.DataArrayTexture>();
     for (let l = 0; l < L; l++)
       for (let h = 0; h < H; h++) {
@@ -514,6 +528,7 @@ export class ModelView {
 
   /** Update uv rectangles so every activation block shows exactly `tokens.length` tokens. */
   setTokens(tokens: string[]): void {
+    this.dirty = true;
     this.tokens = tokens;
     const n = Math.min(tokens.length, ACT_T);
     const P = this.layout.placements;
@@ -538,30 +553,36 @@ export class ModelView {
 
   // ------------------------------------------------------------- display
   setColormap(weights: string, delta?: string): void {
+    this.dirty = true;
     this.uniforms.uRowW.value = this.lutRow(weights);
     if (delta) this.uniforms.uRowD.value = this.lutRow(delta);
   }
 
   setView(view: 'weights' | 'delta'): void {
+    this.dirty = true;
     this.uniforms.uView.value = view === 'delta' ? 1 : 0;
     this.uniforms.uFill.value = view === 'delta' ? 0.05 : 0.28;
   }
 
   setBrightness(v: number): void {
+    this.dirty = true;
     this.uniforms.uBright.value = v;
   }
 
   setDeltaGain(v: number): void {
+    this.dirty = true;
     this.uniforms.uDeltaGain.value = v;
   }
 
   setActivityMode(mode: 'none' | 'inference' | 'training'): void {
+    this.dirty = true;
     if (mode === 'training') this.glowColor.setRGB(1.0, 0.5, 0.12);
     else this.glowColor.setRGB(0.25, 0.75, 1.0);
     this.uniforms.uDim.value = mode === 'none' ? 1 : 0.6;
   }
 
   setLabelsVisible(v: boolean): void {
+    this.dirty = true;
     this.labelsVisible = v;
     for (const o of [...this.floorLabels, ...this.itemLabels]) o.visible = v;
   }
@@ -580,6 +601,7 @@ export class ModelView {
 
   private setSel(idx: number, v: number): void {
     if (idx < 0) return;
+    this.dirty = true;
     const c = this.chunkOf(idx);
     (c.aSel.array as Float32Array)[this.instIndex[idx]] = v;
     c.aSel.needsUpdate = true;
@@ -676,6 +698,7 @@ export class ModelView {
   }
 
   clearActivity(): void {
+    this.dirty = true;
     this.cur.fill(0);
     this.flash.fill(0);
     this.pend.fill(0);
@@ -695,6 +718,7 @@ export class ModelView {
 
   update(dt: number): void {
     if (!this.animating) return;
+    this.dirty = true;
     const now = performance.now() / 1000;
     const decay = Math.exp(-dt * 3.5);
     let busy = false;
@@ -736,6 +760,7 @@ export class ModelView {
 
   /** Logit-lens labels next to each layer: top-1 token per layer. */
   setLens(lens: [string, number][][]): void {
+    this.dirty = true;
     this.lensLabels.forEach((l, i) => {
       const row = lens[i];
       if (!row || !row.length) {

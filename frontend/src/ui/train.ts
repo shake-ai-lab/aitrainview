@@ -1,5 +1,6 @@
-import { api } from '../api';
+import { api, desktop } from '../api';
 import type { AppCtx } from '../ctx';
+import type { RuntimeInfo } from '../types';
 import { fmtCount, fmtVal, h } from '../util';
 import { LossChart } from './draw';
 
@@ -16,13 +17,18 @@ const DEMO = [
   .map(([q, a]) => JSON.stringify({ messages: [{ role: 'user', content: q }, { role: 'assistant', content: a }] }))
   .join('\n');
 
+// matrices offered for training (the backend's default is the same list: runtime.DEFAULT_TARGETS)
 const TARGETS = ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj'];
 
 export class TrainPanel {
   readonly el = h('div', { class: 'tab-body' });
-  private method = h('select', {}, h('option', { value: 'lora' }, 'LoRA'), h('option', { value: 'full' }, 'フル微調整（小型モデル・fp32のみ）')) as HTMLSelectElement;
+  private method = h('select', { onchange: () => this.updateMethod() },
+    h('option', { value: 'lora' }, 'LoRA'),
+    h('option', { value: 'full' }, 'フル微調整（小型モデル・fp32 / bf16）')) as HTMLSelectElement;
   private rank = num('8', 1, 256);
   private alpha = num('16', 1, 1024);
+  private rankRow = h('label', {}, 'LoRA rank', this.rank);
+  private alphaRow = h('label', {}, 'LoRA alpha', this.alpha);
   private lr = num('0.0002', 0, 1, 'any');
   private steps = num('60', 1, 100000);
   private bs = num('2', 1, 64);
@@ -39,7 +45,9 @@ export class TrainPanel {
   private chartCanvas = h('canvas');
   private chart: LossChart;
   private samples = h('div', { class: 'samples' });
-  private loraInfo = h('div', { class: 'muted small' });
+  private resultInfo = h('div', { class: 'muted small' });
+  private saveBtn = h('button', { onclick: () => this.save() }, '保存');
+  private resetBtn = h('button', { onclick: () => this.reset() }, 'リセット');
   private running = false;
 
   constructor(private app: AppCtx) {
@@ -48,8 +56,8 @@ export class TrainPanel {
       h('div', { class: 'grid2' },
         h('label', {}, '手法', this.method),
         h('label', {}, 'ステップ数', this.steps),
-        h('label', {}, 'LoRA rank', this.rank),
-        h('label', {}, 'LoRA alpha', this.alpha),
+        this.rankRow,
+        this.alphaRow,
         h('label', {}, '学習率', this.lr),
         h('label', {}, 'バッチ', this.bs),
         h('label', {}, '系列長', this.seq),
@@ -70,12 +78,9 @@ export class TrainPanel {
         h('button', { onclick: () => this.app.setView('delta') }, 'ΔW を表示'),
         h('button', { onclick: () => this.app.setView('weights') }, '重みを表示'),
       ),
-      h('div', { class: 'sub' }, 'LoRA'),
-      this.loraInfo,
-      h('div', { class: 'row' },
-        h('button', { onclick: () => this.save() }, '保存（PEFT形式）'),
-        h('button', { onclick: () => this.reset() }, 'リセット'),
-      ),
+      h('div', { class: 'sub' }, '学習結果'),
+      this.resultInfo,
+      h('div', { class: 'row' }, this.saveBtn, this.resetBtn),
       h('div', { class: 'sub' }, '生成サンプルの変化'),
       this.samples,
     );
@@ -90,21 +95,33 @@ export class TrainPanel {
       this.app.toast(`学習エラー: ${m.message}`, 'error');
       this.setRunning(false);
     });
-    s.on('lora_reset', () => {
-      this.app.view?.clearDelta();
-      this.app.rel.clear();
-      this.app.grads.clear();
-    });
-    s.on('runtime', (m) => this.updateLora(m.info));
-    s.on('hello', (m) => this.updateLora(m.runtime)); // (re)connect: pick up a LoRA that already exists
-    this.updateLora(null);
+    s.on('train_reset', () => this.app.clearTrainingView());
+    s.on('runtime', (m) => this.updateResult(m.info));
+    s.on('hello', (m) => this.updateResult(m.runtime)); // (re)connect: pick up results that already exist
+    this.updateResult(null);
+    this.updateMethod();
   }
 
-  private updateLora(info: any): void {
+  private updateMethod(): void {
+    const lora = this.method.value === 'lora';
+    this.rankRow.style.display = lora ? '' : 'none';
+    this.alphaRow.style.display = lora ? '' : 'none';
+  }
+
+  private updateResult(info: RuntimeInfo | null): void {
     const l = info?.lora;
-    this.loraInfo.textContent = l
-      ? `${l.modules} 行列に LoRA (r=${l.r}, α=${l.alpha}) / 累計 ${l.steps} ステップ / ${l.enabled ? '有効' : '無効'}`
-      : 'まだ LoRA はありません';
+    const f = info?.full;
+    const unsaved = info?.unsaved ? '（未保存）' : '';
+    this.resultInfo.textContent = f
+      ? `フル微調整: ${f.modules} 行列 / 累計 ${f.steps} ステップ${unsaved}。読み込んだ重みそのものが変わっています`
+      : l
+        ? `LoRA: ${l.modules} 行列 (r=${l.r}, α=${l.alpha}) / 累計 ${l.steps} ステップ${unsaved}`
+        : 'まだ学習していません';
+    this.saveBtn.textContent = f ? '保存（モデル一式・safetensors）' : '保存（LoRA・PEFT形式）';
+    this.resetBtn.textContent = f ? '元に戻す（ディスクから再読み込み）' : 'リセット（LoRA を外す）';
+    const idle = !info?.busy && info?.state === 'ready';
+    this.saveBtn.disabled = !idle || (!f && !l);
+    this.resetBtn.disabled = !idle || (!f && !l);
     if (!info?.busy && this.running) this.setRunning(false);
   }
 
@@ -139,21 +156,36 @@ export class TrainPanel {
   }
 
   private async save(): Promise<void> {
+    const full = !!this.app.runtime?.full;
+    let parent: string | null = null;
+    if (desktop) {
+      // a new <lora|full>-<time> folder is created inside the chosen one
+      parent = await desktop.pickFolder(full ? '保存先のフォルダを選択（モデル一式を新しいフォルダに書き出します）'
+        : '保存先のフォルダを選択（LoRA を新しいフォルダに書き出します）');
+      if (!parent) return;
+    }
+    this.saveBtn.disabled = true;
+    if (full) this.app.toast('モデル一式を書き出しています…', 'info');
     try {
-      const r = await api.post('/api/lora/save', {});
+      const r = await api.post('/api/train/save', parent ? { parent } : {});
       this.app.toast(`保存しました: ${r.path}`, 'ok');
     } catch (e) {
-      this.app.toast(String(e), 'error');
+      this.app.toast(String(e instanceof Error ? e.message : e), 'error');
+    } finally {
+      this.updateResult(this.app.runtime);
     }
   }
 
   private async reset(): Promise<void> {
+    const full = !!this.app.runtime?.full;
+    if (!(await this.app.confirmDiscard(full ? '学習前の重みに戻す' : 'LoRA を外す'))) return;
     try {
-      const info = await api.post('/api/lora/reset');
-      this.updateLora(info);
-      this.app.toast('LoRA をリセットしました（元の重みに戻りました）', 'ok');
+      const info = await api.post('/api/train/reset');
+      this.updateResult(info);
+      this.app.toast(info.reloading ? '元の重みをディスクから読み込み直しています…'
+        : 'LoRA をリセットしました（元の重みに戻りました）', 'ok');
     } catch (e) {
-      this.app.toast(String(e), 'error');
+      this.app.toast(String(e instanceof Error ? e.message : e), 'error');
     }
   }
 
