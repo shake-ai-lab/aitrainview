@@ -8,7 +8,7 @@ Hugging Face Trainer (one line)::
 A hand-written loop::
 
     from aitrainview.watch import watch
-    w = watch(model)                  # attaches to the running app
+    w = watch(model, tokenizer=tok)   # attaches to the running app (tokenizer: optional)
     for batch in loader:
         loss = ...
         loss.backward()
@@ -17,10 +17,11 @@ A hand-written loop::
         optimizer.zero_grad()
     w.close()
 
-Your script trains; the app shows the weights, the gradient of every matrix
-and how far each one moved (ΔW) live. PEFT LoRA layers are shown as the ΔW of
-the matrix they adapt. If the app is not running, everything here quietly does
-nothing, so a training run is never broken by the viewer.
+Your script trains; the app shows the weights, the gradient of every matrix,
+how far each one moved (ΔW) and, every few seconds, the activations of one
+training step, live. PEFT LoRA layers are shown as the ΔW of the matrix they
+adapt. If the app is not running, everything here quietly does nothing, so a
+training run is never broken by the viewer.
 
 Needs only torch (and transformers for the callback). The app is found through
 AITV_URL, else the port in ~/.aitrainview/backend.json, else 127.0.0.1:8765.
@@ -31,6 +32,7 @@ import json
 import math
 import os
 import queue
+import re
 import threading
 import time
 import urllib.error
@@ -38,9 +40,11 @@ import urllib.request
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from .events import frame
+from .runtime import ACT_P, ACT_T  # the app's activation-block size (channels x positions)
 
 MODES = ("rms", "mean", "absmax", "sample")
 SIGNED = {"mean", "sample"}
@@ -208,12 +212,25 @@ class Watcher:
     """Streams one model's training to the app. See the module docstring."""
 
     def __init__(self, model: torch.nn.Module, name: str | None = None, url: str | None = None,
-                 every_sec: float = 0.7, source: str | None = None):
+                 every_sec: float = 0.7, source: str | None = None, act_every_sec: float | None = 3.0,
+                 tokenizer=None):
+        """every_sec: at most one ΔW update per this many seconds.
+        act_every_sec: capture the activations of one training step this often (None = never).
+        tokenizer: decodes the captured tokens for the activation view (optional)."""
         self.model = model
         self.url = (url or _url()).rstrip("/")
         self.name = name or _model_name(model)
         self.source = source or self.name
         self.every = every_sec
+        self.act_every = act_every_sec
+        self.tokenizer = tokenizer
+        self._act_handles: list = []
+        self._act_mods: list = []
+        self._layer_mods: list = []
+        self._cap: dict = {}
+        self._cap_ids = None
+        self._conv_model = False
+        self._last_act = 0.0
         self.enabled = False
         self.stop_requested = False  # the user pressed stop in the app
         self.steps = None
@@ -292,6 +309,7 @@ class Watcher:
         self.enabled = True
         try:
             self._track(params, ids)
+            self._setup_acts(ids, r.get("layers_prefix") or "")
             self._send_thumbnails(params, ids)
             self._post("/api/ext/ready", {"run": self.run})
         except Exception as e:  # never break the training run
@@ -306,6 +324,7 @@ class Watcher:
                      "trainable_params": n_train, "examples": examples, "ids": self._ids,
                      "sample_prompts": [], "tile": self.size, "external": True})
         self._t0 = self._last_t = time.time()
+        self.arm_activations(force=True)  # the first forward pass is captured
         return True
 
     def _track(self, params: dict, ids: dict) -> None:
@@ -355,6 +374,127 @@ class Watcher:
             if len(batch) >= 32:
                 flush()
         flush()
+
+    # ---------------------------------------------------------- activations
+    def _setup_acts(self, ids: dict, layers_prefix: str) -> None:
+        """Modules whose activations are captured, with the keys the app's activation blocks use:
+        o:<tid> / i:<tid> output / input of the module owning tensor <tid>, r:<n> / ro:<n> the stream
+        entering / leaving repeated block n (the residual stream of a transformer)."""
+        self._act_mods = []  # (tid, module, channels_first)
+        self._layer_mods = []  # (index, module)
+        pat = re.compile(re.escape(layers_prefix) + r"\.(\d+)$") if layers_prefix else None
+        conv_like = (nn.modules.conv._ConvNd, nn.modules.batchnorm._BatchNorm)
+        # in a convolutional model every 4-D activation is a [B, C, H, W] feature map (also after ReLU / pooling)
+        self._conv_model = any(isinstance(m, nn.modules.conv._ConvNd) for m in self.model.modules())
+        for mname, mod in self.model.named_modules():
+            if not mname or mname.endswith(".base_layer") or ".lora_" in mname:
+                continue
+            n = norm_name(mname)
+            if n is None:
+                continue
+            m = pat.match(n) if pat else None
+            if m:
+                self._layer_mods.append((int(m.group(1)), mod))
+            if hasattr(mod, "lora_A") and hasattr(mod, "base_layer"):  # PEFT layer: shown on its base matrix
+                tid = ids.get(norm_name(f"{mname}.base_layer.weight"))
+                base = mod.base_layer
+            else:
+                tid = ids.get(f"{n}.weight") if isinstance(getattr(mod, "weight", None), torch.Tensor) else None
+                base = mod
+            if tid is not None:
+                self._act_mods.append((tid, mod, isinstance(base, conv_like)))
+
+    @staticmethod
+    def _to_rows(x, channels_first: bool):
+        """First sample of a batch as positions x channels (≤ ACT_T x ACT_P), each row scaled to uint8.
+        Tokens x channels for sequence models; (H·W) x C for conv feature maps."""
+        if not torch.is_tensor(x) or not x.is_floating_point() or x.dim() < 2:
+            return None
+        t = x[0].detach()
+        if t.dim() == 1:  # e.g. the output of a classifier: one position
+            t = t[None]
+        elif t.dim() == 3:
+            t = t.flatten(1).t() if channels_first else t.reshape(t.shape[0], -1)
+        elif t.dim() != 2:
+            return None
+        if t.shape[-1] > 65536:  # e.g. vocabulary logits
+            return None
+        t = torch.nan_to_num(t[:ACT_T].float())
+        P = min(t.shape[-1], ACT_P)
+        if t.shape[-1] != P:
+            t = F.adaptive_avg_pool1d(t[None], P)[0]
+        s = t.abs().amax(-1, keepdim=True).clamp_min(1e-12)
+        return (t / s * 127.5 + 127.5).round().clamp(0, 255).to(torch.uint8)
+
+    def arm_activations(self, force: bool = False) -> None:
+        """Hook the model so that the next forward pass is captured (at most every act_every_sec)."""
+        if not self.enabled or self.act_every is None or self._act_handles:
+            return
+        if not force and time.time() - self._last_act < self.act_every:
+            return
+        cap = self._cap = {}
+        self._cap_ids = None
+
+        def put(key, x, cf):
+            if key not in cap:  # first forward only (gradient checkpointing runs it twice)
+                cf = cf or (self._conv_model and torch.is_tensor(x) and x.dim() == 4)
+                with torch.no_grad():
+                    r = self._to_rows(x, cf)
+                if r is not None:
+                    cap[key] = r
+
+        def out_hook(tid, cf):
+            return lambda mod, inp, out: put(f"o:{tid}", out[0] if isinstance(out, (tuple, list)) else out, cf)
+
+        def in_hook(tid, cf):
+            return lambda mod, args: put(f"i:{tid}", args[0], cf) if args else None
+
+        def layer_in(li):
+            return lambda mod, args, kwargs: put(f"r:{li}", args[0] if args else kwargs.get("hidden_states"), False)
+
+        def layer_out(li):
+            return lambda mod, inp, out: put(f"ro:{li}", out[0] if isinstance(out, (tuple, list)) else out, False)
+
+        def tokens(mod, args, kwargs):
+            ids = kwargs.get("input_ids", args[0] if args else None)
+            if self._cap_ids is None and torch.is_tensor(ids) and ids.dim() == 2 and not ids.is_floating_point():
+                self._cap_ids = ids[0, :ACT_T].tolist()
+
+        handles = [self.model.register_forward_pre_hook(tokens, with_kwargs=True)]
+        for tid, mod, cf in self._act_mods:
+            handles.append(mod.register_forward_hook(out_hook(tid, cf)))
+            if not isinstance(mod, nn.Embedding):
+                handles.append(mod.register_forward_pre_hook(in_hook(tid, cf)))
+        for li, mod in self._layer_mods:
+            handles.append(mod.register_forward_pre_hook(layer_in(li), with_kwargs=True))
+            handles.append(mod.register_forward_hook(layer_out(li)))
+        self._act_handles = handles
+
+    def _unhook(self) -> None:
+        for h in self._act_handles:
+            h.remove()
+        self._act_handles = []
+
+    def flush_activations(self, step: int) -> None:
+        """Send what the armed forward pass captured (call after the step)."""
+        if not self._act_handles or not self._cap:
+            return  # not armed, or no forward pass ran yet
+        self._unhook()
+        self._last_act = time.time()
+        keys = list(self._cap)
+        tiles = [self._cap[k] for k in keys]
+        self._cap = {}
+        if not self.enabled:
+            return
+        payload = torch.cat([t.reshape(-1) for t in tiles]).cpu().numpy().tobytes()
+        toks = None
+        if self._cap_ids is not None and self.tokenizer is not None:
+            try:
+                toks = [self.tokenizer.decode([i]) for i in self._cap_ids]
+            except Exception:
+                toks = None
+        self._event({"type": "train_acts", "step": int(step), "n": max(t.shape[0] for t in tiles), "tokens": toks,
+                     "entries": [[k, int(t.shape[1]), int(t.shape[0])] for k, t in zip(keys, tiles)]}, payload)
 
     # ------------------------------------------------------------ telemetry
     @torch.no_grad()
@@ -442,9 +582,12 @@ class Watcher:
         if torch.is_tensor(loss):
             loss = loss.detach().float().item()
         self.log(self._step, loss=loss, lr=lr)
+        self.flush_activations(self._step)  # captured in this step's forward pass
         self.maybe_delta(self._step)
+        self.arm_activations()  # capture a later forward pass
 
     def done(self, step: int | None = None, stopped: bool | None = None) -> None:
+        self._unhook()
         if not self.enabled:
             return
         step = self._step if step is None else step
@@ -483,10 +626,12 @@ class AITrainViewCallback(_Base):
 
     log_every: send loss / gradients every N optimizer steps (it makes the Trainer
     log at that interval). every_sec: at most one ΔW update per this many seconds.
+    act_every_sec: capture the activations of one step this often (None = off).
     """
 
-    def __init__(self, name: str | None = None, url: str | None = None, log_every: int = 1, every_sec: float = 0.7):
-        self.kw = {"name": name, "url": url, "every_sec": every_sec}
+    def __init__(self, name: str | None = None, url: str | None = None, log_every: int = 1, every_sec: float = 0.7,
+                 act_every_sec: float | None = 3.0):
+        self.kw = {"name": name, "url": url, "every_sec": every_sec, "act_every_sec": act_every_sec}
         self.log_every = max(1, int(log_every))
         self.w: Watcher | None = None
 
@@ -498,8 +643,13 @@ class AITrainViewCallback(_Base):
             examples = len(train_dataloader.dataset)
         except Exception:
             pass
-        self.w = Watcher(model, **self.kw)
+        tok = kw.get("processing_class") or kw.get("tokenizer")
+        self.w = Watcher(model, tokenizer=tok if hasattr(tok, "decode") else None, **self.kw)
         self.w.attach(steps=state.max_steps or None, examples=examples)
+
+    def on_step_begin(self, args, state, control, **kw):
+        if self.w and self.w.enabled:
+            self.w.arm_activations()
 
     def on_pre_optimizer_step(self, args, state, control, **kw):
         if self.w and self.w.enabled and (state.global_step + 1) % self.log_every == 0:
@@ -510,6 +660,7 @@ class AITrainViewCallback(_Base):
             return
         if state.global_step % self.log_every == 0:
             control.should_log = True
+        self.w.flush_activations(state.global_step)
         self.w.maybe_delta(state.global_step)
         if self.w.stop_requested:
             control.should_training_stop = True

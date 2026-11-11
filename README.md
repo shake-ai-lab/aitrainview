@@ -107,10 +107,11 @@ w.close()
 
 - アプリを先に起動しておきます。スクリプトが接続すると、そのモデルが 3D に表示され、学習タブに loss・勾配・ΔW が流れます
 - PEFT の LoRA は、元の行列に対する ΔW（B·A）として表示します。フル微調整は学習開始時からの変化を表示します
+- 数秒に 1 回、学習 1 ステップ分の**活性**（バッチの先頭サンプルが各層を通ったときの値）も送ります。LLM はフロー表示の活性ブロックにトークン付きで、CNN などは「位置 × チャネル」として表示します。行列をクリックすると、詳細パネルにその層の出力の活性が出ます（学習時の attention の重みは取れないため、softmax(QKᵀ) のブロックは空のままです）
 - アプリの「■ 停止」で、スクリプトの学習を止められます（HF Trainer は自動、自作ループは `w.stop_requested` を見る）
 - アプリが起動していなければ何もしません（学習はそのまま続きます）
 - 接続先は `AITV_URL`、なければアプリが書く `~/.aitrainview/backend.json` のポート、なければ `127.0.0.1:8765`
-- `AITrainViewCallback(log_every=1, every_sec=0.7)`: loss・勾配を送る間隔（ステップ）と ΔW を送る最短間隔（秒）
+- `AITrainViewCallback(log_every=1, every_sec=0.7, act_every_sec=3.0)`: loss・勾配を送る間隔（ステップ）、ΔW を送る最短間隔（秒）、活性を取る間隔（秒、`None` で無効）。自作ループでは `watch(model, tokenizer=tok)` とするとトークンも表示されます
 
 動く例: `examples/hf_lora_trainer.py`（Qwen3-0.6B を HF Trainer + PEFT LoRA で学習）、`examples/custom_loop_cnn.py`（自作ループで CNN を学習）。
 

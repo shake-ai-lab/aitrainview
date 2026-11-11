@@ -627,7 +627,7 @@ def train_save(req: SaveReq):
 # A training script calls aitrainview.watch (or uses its HF Trainer callback):
 # it sends the model's parameter list, weight thumbnails and live telemetry,
 # and the app shows the run exactly like its own training. The script trains.
-EXT_EVENTS = {"train_start", "train_step", "train_delta", "train_done", "train_error", "train_sample"}
+EXT_EVENTS = {"train_start", "train_step", "train_delta", "train_acts", "train_done", "train_error", "train_sample"}
 
 
 class _Entry:
@@ -677,7 +677,9 @@ def ext_attach(req: AttachReq):
             S.ckpt.close()
         S.ckpt, S.structure, S.model_dir = None, st, req.source
         S.ext = ExtRun(run, req.name, size, n, stats=[None] * n)
-    return {"run": run, "size": size, "ids": {t["name"]: t["id"] for t in st["tensors"]}}
+    main = st["towers"][st.get("main_tower", 0)] if st["towers"] else {"prefix": ""}
+    return {"run": run, "size": size, "ids": {t["name"]: t["id"] for t in st["tensors"]},
+            "layers_prefix": main["prefix"]}  # the repeated blocks (for residual-stream activations)
 
 
 @app.post("/api/ext/tiles")

@@ -275,6 +275,9 @@ export class ModelView {
   private deltaScales = new Map<number, number>();
   private deltaGlobal = 0;
   private actKeys = new Set<string>();
+  // channels / rows actually written per activation tile: a block shows only that part
+  // (a CNN's feature maps have 3..512 channels and fewer positions in deeper layers)
+  private actShape = new Map<string, { P: number; n: number }>();
   tokens: string[] = [];
   labelsVisible = true;
   glowColor = new THREE.Color(0.25, 0.75, 1.0);
@@ -500,6 +503,7 @@ export class ModelView {
   resetActivations(tokens: string[]): void {
     this.dirty = true;
     this.actKeys.clear();
+    this.actShape.clear();
     for (const c of this.a.chunks) {
       (c.atlas.image.data as Uint8Array).fill(0);
       c.atlas.clearLayerUpdates();
@@ -514,8 +518,26 @@ export class ModelView {
     const dirty = new Set<THREE.DataArrayTexture>();
     let off = 0;
     for (const [key, P] of entries) {
-      if (this.a.writeRows(key, t0, nt, payload, off, P, 'atlas', dirty)) this.actKeys.add(key);
+      if (this.a.writeRows(key, t0, nt, payload, off, P, 'atlas', dirty)) {
+        this.actKeys.add(key);
+        this.actShape.set(key, { P, n: Math.max(this.actShape.get(key)?.n ?? 0, t0 + nt) });
+      }
       off += nt * P;
+    }
+    for (const t of dirty) t.needsUpdate = true;
+  }
+
+  /** train_acts frame: one snapshot, each entry [key, channels, rows] with its own row count. */
+  writeActivationTiles(entries: [string, number, number][], payload: Uint8Array): void {
+    this.dirty = true;
+    const dirty = new Set<THREE.DataArrayTexture>();
+    let off = 0;
+    for (const [key, P, n] of entries) {
+      if (this.a.writeRows(key, 0, n, payload, off, P, 'atlas', dirty)) {
+        this.actKeys.add(key);
+        this.actShape.set(key, { P, n });
+      }
+      off += n * P;
     }
     for (const t of dirty) t.needsUpdate = true;
   }
@@ -547,9 +569,10 @@ export class ModelView {
         sc[i] = has ? 1 : 0;
         if (p.attn) uv.set([0, 0, n / ACT_P, n / ACT_T], i * 4);
         else {
-          const k = (p.P ?? ACT_P) / ACT_P;
+          const w = this.actShape.get(p.tile);
+          const k = Math.min(p.P ?? ACT_P, w?.P ?? ACT_P) / ACT_P;
           const [c0, c1] = p.chan ?? [0, 1];
-          uv.set([c0 * k, 0, c1 * k, Math.max(n, 1) / ACT_T], i * 4);
+          uv.set([c0 * k, 0, c1 * k, Math.max(Math.min(n, w?.n ?? n), 1) / ACT_T], i * 4);
         }
       });
       c.aUv.needsUpdate = true;
@@ -632,6 +655,11 @@ export class ModelView {
 
   placementsOf(tid: number): number[] {
     return this.slots.get(tid) ?? [];
+  }
+
+  /** Channels / rows written into an activation tile (undefined: nothing yet). */
+  activationShape(key: string): { P: number; n: number } | undefined {
+    return this.actShape.get(key);
   }
 
   hasActivation(key: string): boolean {

@@ -27,6 +27,9 @@ export interface AppCtx {
   confirmDiscard(action: string): Promise<boolean>;
   /** Training results were undone: forget ΔW / gradients in the view and the panels. */
   clearTrainingView(): void;
+  /** Latest captured activation of an attached training run ("o:<tid>" = output of that matrix's module):
+   *  n rows (positions / tokens) x P channels, uint8 with 127.5 = 0, each row scaled to its max |value|. */
+  activation(key: string): { P: number; n: number; bytes: Uint8Array; tokens: string[] } | undefined;
   select(tid: number): void;
   setView(v: 'weights' | 'delta'): void;
   setActivityMode(mode: 'none' | 'inference' | 'training'): void;

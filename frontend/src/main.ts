@@ -43,7 +43,9 @@ class App implements AppCtx {
   private tokens: string[] = []; // prompt + generated tokens of the current inference
   // what the last inference / training wrote into the 3D view, re-applied when the
   // view is rebuilt (layout switch); the backend only streams it once
-  private actFrames: { attn: boolean; m: any; payload: Uint8Array }[] = [];
+  private actFrames: { kind: 'acts' | 'attn' | 'snapshot'; m: any; payload: Uint8Array }[] = [];
+  // latest activations of an attached training run per key ("o:<tid>" ...), for the detail panel
+  private actTiles = new Map<string, { P: number; n: number; bytes: Uint8Array }>();
   private actBytes = 0;
   private actTokens = 0;
   private lastLens: [string, number][][] | null = null;
@@ -345,6 +347,7 @@ class App implements AppCtx {
 
   private forgetActivations(): void {
     this.actFrames = [];
+    this.actTiles.clear();
     this.actBytes = 0;
     this.actTokens = 0;
     this.lastLens = null;
@@ -367,7 +370,8 @@ class App implements AppCtx {
     }
     if (this.actFrames.length) {
       for (const f of this.actFrames) {
-        if (f.attn) view.writeAttention(f.m.q0, f.m.nq, f.m.nk, f.m.L, f.m.H, f.payload);
+        if (f.kind === 'attn') view.writeAttention(f.m.q0, f.m.nq, f.m.nk, f.m.L, f.m.H, f.payload);
+        else if (f.kind === 'snapshot') view.writeActivationTiles(f.m.entries, f.payload);
         else view.writeActivations(f.m.t0, f.m.nt, f.m.entries, f.payload);
       }
       view.setTokens(this.tokens.slice(0, this.actTokens));
@@ -375,9 +379,9 @@ class App implements AppCtx {
     if (this.lastLens) view.setLens(this.lastLens);
   }
 
-  private recordActivations(attn: boolean, m: any, payload: Uint8Array): void {
+  private recordActivations(kind: 'acts' | 'attn' | 'snapshot', m: any, payload: Uint8Array): void {
     if (this.actBytes > 96 * 2 ** 20) return; // a very long generation: replay only the beginning
-    this.actFrames.push({ attn, m, payload });
+    this.actFrames.push({ kind, m, payload });
     this.actBytes += payload.byteLength;
   }
 
@@ -661,7 +665,7 @@ class App implements AppCtx {
     });
     s.on('infer_acts', (m, payload) => {
       if (!payload) return;
-      this.recordActivations(false, m, payload);
+      this.recordActivations('acts', m, payload);
       this.actTokens = Math.max(this.actTokens, m.t0 + m.nt);
       if (!this.view) return;
       this.view.writeActivations(m.t0, m.nt, m.entries, payload);
@@ -669,9 +673,35 @@ class App implements AppCtx {
     });
     s.on('infer_attn', (m, payload) => {
       if (!payload) return;
-      this.recordActivations(true, m, payload);
+      this.recordActivations('attn', m, payload);
       this.view?.writeAttention(m.q0, m.nq, m.nk, m.L, m.H, payload);
     });
+    // an attached training run: activations of one training step (a whole snapshot each time)
+    s.on('train_acts', (m, payload) => {
+      if (!payload) return;
+      this.forgetActivations();
+      const n: number = m.n;
+      this.tokens = m.tokens ?? Array.from({ length: n }, (_, i) => `#${i}`);
+      let off = 0;
+      for (const [key, P, rows] of m.entries as [string, number, number][]) {
+        this.actTiles.set(key, { P, n: rows, bytes: payload.slice(off, off + P * rows) });
+        off += P * rows;
+      }
+      this.recordActivations('snapshot', m, payload);
+      this.actTokens = n;
+      this.lastLens = null;
+      if (this.view) {
+        this.view.resetActivations([]);
+        this.view.writeActivationTiles(m.entries, payload);
+        this.view.setTokens(this.tokens.slice(0, n));
+      }
+      if (this.inspect.current >= 0) this.inspect.renderDelta();
+    });
+  }
+
+  activation(key: string): { P: number; n: number; bytes: Uint8Array; tokens: string[] } | undefined {
+    const a = this.actTiles.get(key);
+    return a ? { ...a, tokens: this.tokens.slice(0, a.n) } : undefined;
   }
 }
 

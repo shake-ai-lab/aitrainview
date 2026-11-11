@@ -59,7 +59,8 @@ export class InspectPanel {
     this.req++;
     const view = this.app.view;
     if (!view) return;
-    const n = Math.min(view.tokens.length, ACT_T);
+    const shape = view.activationShape(p.tile);
+    const n = Math.min(view.tokens.length, ACT_T, shape?.n ?? ACT_T);
     const tile = view.activationTile(p.tile);
     const head = p.head !== undefined ? ` · head ${p.head}` : '';
     const layer = p.floor >= 0 && p.floor < 1e6 ? `L${p.floor} · ` : '';
@@ -80,7 +81,7 @@ export class InspectPanel {
       drawMatrix(canvas, m, n, n, 'ice', { width, maxHeight: 320, aspect: 1 });
       parts.push(h('div', { class: 'sub' }, `行 = query（${n}）, 列 = key（${n}）, 色 = √確率`), canvas);
     } else {
-      const P = p.P ?? ACT_P;
+      const P = Math.min(p.P ?? ACT_P, shape?.P ?? ACT_P);
       const [c0, c1] = p.chan ?? [0, 1];
       const a = Math.floor(c0 * P);
       const b = Math.max(a + 1, Math.round(c1 * P));
@@ -198,6 +199,25 @@ export class InspectPanel {
           h('span', {}, '‖ΔW‖ / ‖W‖'), h('b', {}, r !== undefined ? `${(r * 100).toFixed(3)} %` : '–'),
           h('span', {}, '勾配ノルム'), h('b', {}, fmtVal(g)),
         ),
+      );
+    }
+    // an attached training run: what came out of this matrix's module in a recent training step
+    const act = this.app.activation(`o:${tid}`);
+    if (act && act.n > 0) {
+      const c = h('canvas', { class: 'matrix' });
+      const m = new Uint8Array(act.P * act.n); // channels (rows) x positions (columns)
+      for (let ch = 0; ch < act.P; ch++) for (let t = 0; t < act.n; t++) m[ch * act.n + t] = act.bytes[t * act.P + ch];
+      drawMatrix(c, m, act.P, act.n, 'fireice', {
+        width: Math.min(316, this.el.clientWidth - 4 || 316), maxHeight: 300, aspect: Math.min(2.5, act.P / Math.max(act.n, 8)),
+      });
+      const isTokens = act.tokens.length > 0 && !act.tokens[0].startsWith('#');
+      parts.push(
+        h('div', { class: 'sub' }, '出力の活性（学習中のバッチの先頭サンプル）'),
+        c,
+        h('div', { class: 'muted small' },
+          `縦 = チャネル（${act.P}${act.P === ACT_P ? '・多い場合は平均で縮約' : ''}）, 横 = ${isTokens ? 'トークン' : '位置'}（${act.n}）。`,
+          `${isTokens ? 'トークン' : '位置'}ごとに最大絶対値で正規化。青 = 負, 橙 = 正`),
+        isTokens ? h('div', { class: 'tokens small' }, ...act.tokens.map((t) => h('span', { class: 'tok' }, showToken(t)))) : null,
       );
     }
     this.deltaBox.replaceChildren(...parts.filter(Boolean) as HTMLElement[]);

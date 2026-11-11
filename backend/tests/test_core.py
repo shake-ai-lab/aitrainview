@@ -235,6 +235,46 @@ class WatchTest(unittest.TestCase):
         self.assertEqual(norm_name("base_model.model.score.modules_to_save.default.weight"), "score.weight")
         self.assertIsNone(norm_name("base_model.model.score.original_module.weight"))
 
+    def test_activation_capture_shapes(self):
+        import torch
+        import torch.nn as nn
+
+        from aitrainview.watch import Watcher
+
+        class Net(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.conv = nn.Conv2d(3, 8, 3, padding=1)
+                self.bn = nn.BatchNorm2d(8)
+                self.fc = nn.Linear(8 * 4 * 4, 5)
+                self.emb = nn.Embedding(10, 6)
+                self.proj = nn.Linear(6, 300)
+
+            def forward(self, x, ids):
+                return self.fc(self.bn(self.conv(x)).flatten(1)), self.proj(self.emb(ids))
+
+        net = Net()
+        ids = {n: i for i, (n, _) in enumerate(net.named_parameters())}
+        w = Watcher(net, url="http://127.0.0.1:9")
+        w._setup_acts(ids, "")
+        w.enabled, w.run = True, "test"
+        sent = []
+        w._event = lambda h, p=b"": sent.append((h, p))
+        w.arm_activations(force=True)
+        net(torch.randn(2, 3, 4, 4), torch.randint(0, 10, (2, 7)))
+        net(torch.randn(2, 3, 4, 4), torch.randint(0, 10, (2, 7)))  # a second pass is not captured again
+        w.flush_activations(1)
+        (h, payload), = sent
+        ent = {k: (P, n) for k, P, n in h["entries"]}
+        self.assertEqual(ent[f"o:{ids['conv.weight']}"], (8, 16))  # (H·W)=16 positions x 8 channels
+        self.assertEqual(ent[f"i:{ids['conv.weight']}"], (3, 16))
+        self.assertEqual(ent[f"o:{ids['bn.weight']}"], (8, 16))
+        self.assertEqual(ent[f"o:{ids['fc.weight']}"], (5, 1))  # a vector per sample: one position
+        self.assertEqual(ent[f"o:{ids['proj.weight']}"], (256, 7))  # tokens x channels, pooled to 256
+        self.assertNotIn(f"i:{ids['emb.weight']}", ent)  # token ids are not activations
+        self.assertEqual(len(payload), sum(P * n for P, n in ent.values()))
+        self.assertFalse(w._act_handles)  # unhooked after one snapshot
+
     def test_no_app_is_a_no_op(self):
         import torch
 
